@@ -118,29 +118,94 @@ Optuna(NSGA-II, 150 試行)による適合最適化のベースライン比:
 | `amtlab dataset --samples 800` | ランダム DoE データセット生成のみ |
 | `amtlab analyze --dataset path.csv` | 既存データセットから解析のみ |
 | `amtlab calibrate --trials 200 --mode pareto` | 適合値の多目的最適化のみ |
-| `amtlab demo-log` / `amtlab ingest --log log.csv` | 実車ログ形式の取り込み・イベント切り出し |
+| `amtlab inspect --log log.csv` | ログの信号構成・サンプルレート診断(J1939 自動検出) |
+| `amtlab ingest --log log.csv` | 実車ログから変速イベントを切り出して KPI 化 |
+| `amtlab demo-log --j1939` | J1939 形式のデモログ生成 |
 | `amtlab report --summary outputs/summary.json` | レポートだけ再生成(モデル差し替え検証に) |
 | `amtlab ollama` | Ollama の疎通確認 |
 
-## 実車ログを解析する
+## 実車ログを解析する(J1939 対応)
 
-シミュレーションを使わず、**実測ログをそのまま**投入できます。必要な信号は
-`時刻 / エンジン回転 / 車速 / 選択ギヤ` の 4 本(あればスロットル・駆動軸トルクも使用)。
+シミュレーションを使わず、**実測ログをそのまま**投入できます。
+J1939(DBC デコード済み)なら列名を自動検出します。
 
 ```bash
-amtlab ingest --log mylog.csv \
-  --col-time t --col-engine-speed Ne --col-speed Vsp --col-gear GearPos
+amtlab inspect --log mylog.csv    # まず何が取れているか診断
+amtlab ingest  --log mylog.csv    # 変速イベントを切り出して KPI 化
 ```
 
-ギヤ信号の遷移(ニュートラル経由を含む)から変速イベントを自動抽出し、
-シミュレーションと**同じ KPI スキーマ**の表を作るので、`amtlab analyze` 以降の
-解析コードをそのまま流用できます。
+`inspect` は検出できた SPN・**実効サンプルレート**・注意点を出します。
+
+```
+  SPN  内部名                   列名                                   実効Hz  信号
+   84  speed_kmh             CCVS1_WheelBasedVehicleSpeed         10.0  ホイールベース車速
+  190  engine_speed_rpm      EEC1_EngineSpeed                     50.0  エンジン回転数
+  191  output_shaft_rpm      ETC1_TransmissionOutputShaftSpeed    50.0  アウトプットシャフト回転数
+  522  clutch_slip_pct       ETC1_PercentClutchSlip               50.0  クラッチ滑り率
+  523  gear                  ETC2_TransmissionCurrentGear           離散  現在のギア位置
+  574  shift_in_process      ETC1_TransmissionShiftInProcess        離散  トランスシフトインプロセス
+```
+
+### この信号セットで何が測れるか
+
+| 指標 | J1939 のみ | 使う SPN |
+| --- | --- | --- |
+| 変速時間(トルク相 / 締結相に分解) | ◎ 実測 | 574 + 522 |
+| 車速の落ち込み・車速損失 | ◎ 実測 | 84 / 904 |
+| トルク抜け時間・トルク復帰時間 | ◎ 実測 | 513 × 544 × 526、512 |
+| クラッチすべり時間 | ◎ 実測 | 522 |
+| 吹け上がり | ◎ 実測 | 190 vs 191 × 526 |
+| **ジャーク(乗り心地)** | **△ 参考値** | 車体前後加速度の追加計測が必要 |
+
+**ジャークだけは J1939 では定量評価できません。** 車速(SPN 84)は 10 Hz 程度でしか
+更新されず、階段状の信号を微分すると量子化が偽のジャークになるためです
+(自動でローパスを実効レートの 1/3 まで下げて暴走は防ぎます)。
+50 Hz で来るアウトプットシャフト回転(SPN 191)は**駆動側の速度**なので、
+微分すると乗り心地ではなく駆動軸のねじり振動を測ることになり、代用になりません
+(`driveline_speed_kmh` として振動観察用にだけ保持)。
+各イベントに `jerk_quality`(`measured`/`derived`/`low_rate`/`unusable`)を記録します。
+
+→ **変速時間・車速の落ち込み・トルク抜けにフォーカスするなら、追加計測なしで
+そのまま回せます。**
+
+### 変速イベントの切り出し
+
+**SPN 574(シフトインプロセス)があれば推定不要**で、フラグの立ち上がりが変速開始、
+立ち下がりがギヤ入り。締結完了はクラッチ滑り率(SPN 522)が 1% を切った時刻。
+したがって変速時間が
+
+```
+変速時間 = gear_engage_time_s (トルク相 + ギヤ入りまで) + clutch_close_time_s (締結)
+```
+
+に分解され、遅れがどちらの相にあるか切り分けられます。
+SPN 574 が無い場合はギヤ信号(523)の遷移から推定します(ニュートラル経由に対応)。
+
+### 列名を明示する / 手を入れる
+
+自動検出が外れる場合は明示できます(明示 > 自動検出)。
+
+```bash
+amtlab ingest --log mylog.csv --col-gear GearPos --col-speed Vsp
+```
 
 ```python
 from amtlab.ingest import SignalMap, analyze_log
 
 trace, events = analyze_log("mylog.csv", SignalMap(gear="GearPos"))
-print(events[["from_gear", "to_gear", "shift_time_s", "jerk_rms", "engine_flare_rpm"]])
+print(events[["current_gear", "to_gear", "shift_time_s",
+              "speed_drop_kmh", "speed_loss_kmh", "torque_interrupt_s"]])
+```
+
+出力はシミュレーションと**同じ KPI スキーマ**なので、`amtlab analyze` 以降
+(代理モデル・カレントギア別集計・可視化)をそのまま適用できます。
+
+### 手元にログが無いとき
+
+J1939 形式のデモログ(信号名・単位・PGN ごとの更新周期・分解能を模擬)を作れます。
+
+```bash
+amtlab demo-log --j1939 --out demo.csv && amtlab inspect --log demo.csv
 ```
 
 ## Python API
@@ -196,6 +261,7 @@ CI や LLM 無し環境でもパイプラインは止まりません。
 | `amtlab.simulation.plant` | 4 状態の数値積分(クラッチすべり/ロック、駆動軸ねじり) |
 | `amtlab.dataset` | 実験計画(DoE)とバッチ実行 |
 | `amtlab.features` | 変速品質 KPI の抽出・カレントギア別集計・目的関数 |
+| `amtlab.j1939` | J1939 信号の定義・自動検出・物理量変換・レート診断 |
 | `amtlab.ingest` | 実車ログの取り込み・イベント切り出し |
 | `amtlab.modeling` | scikit-learn 代理モデル・感度解析 |
 | `amtlab.tuning` | Optuna によるハイパーパラメータ探索 |
@@ -210,7 +276,7 @@ CI や LLM 無し環境でもパイプラインは止まりません。
 
 ```bash
 pip install -e ".[dev]"
-pytest -q          # 99 tests / 1 分程度
+pytest -q          # 130 tests / 1 分程度
 ruff check src tests
 ```
 

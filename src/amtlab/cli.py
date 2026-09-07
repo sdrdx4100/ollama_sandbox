@@ -152,8 +152,12 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         gear=args.col_gear,
         throttle=args.col_throttle,
         shaft_torque=args.col_torque,
+        auto_detect=not args.no_auto,
     )
     trace, kpi = analyze_log(args.log, sm, resample_hz=args.resample_hz)
+    print(f"検出: {len(trace.attrs.get('mapping', {}))} 信号 / "
+          f"加速度の出所: {trace.attrs.get('accel_source')} "
+          f"(jerk 信頼度: {trace.attrs.get('jerk_quality')})")
     out = Path(args.out)
     (out / "tables").mkdir(parents=True, exist_ok=True)
     kpi.to_csv(out / "tables" / "log_events.csv", index=False)
@@ -166,14 +170,31 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_demo_log(args: argparse.Namespace) -> int:
-    from .ingest import make_demo_log
+def cmd_inspect(args: argparse.Namespace) -> int:
+    """ログの信号構成とサンプルレートを診断する。"""
+    from .j1939 import format_report, inspect_log
 
-    log = make_demo_log(sample_hz=args.sample_hz, seed=args.seed)
+    df = pd.read_csv(args.log)
+    report = inspect_log(df)
+    print(format_report(report))
+    if args.save:
+        report.to_frame().to_csv(args.save, index=False)
+        print(f"\n-> {args.save}")
+    return 0 if not any("必須" in w for w in report.warnings) else 1
+
+
+def cmd_demo_log(args: argparse.Namespace) -> int:
+    from .ingest import make_demo_log, make_j1939_demo_log
+
+    if args.j1939:
+        log = make_j1939_demo_log(sample_hz=args.sample_hz, seed=args.seed)
+    else:
+        log = make_demo_log(sample_hz=args.sample_hz, seed=args.seed)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     log.to_csv(out, index=False)
-    print(f"{len(log)} samples ({log['time'].iloc[-1]:.1f} s) -> {out}")
+    time_col = "Timestamp" if "Timestamp" in log.columns else "time"
+    print(f"{len(log)} samples ({log[time_col].iloc[-1]:.1f} s) -> {out}")
     return 0
 
 
@@ -259,13 +280,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_in.add_argument("--col-gear", default="gear")
     p_in.add_argument("--col-throttle", default="throttle")
     p_in.add_argument("--col-torque", default="shaft_torque")
+    p_in.add_argument("--no-auto", action="store_true",
+                      help="J1939 の列名自動検出を無効にする")
     p_in.set_defaults(func=cmd_ingest)
 
     p_dl = sub.add_parser("demo-log", help="取り込み確認用のデモログ CSV を生成")
     p_dl.add_argument("--out", default="outputs/data/demo_log.csv")
     p_dl.add_argument("--sample-hz", type=float, default=100.0)
     p_dl.add_argument("--seed", type=int, default=0)
+    p_dl.add_argument("--j1939", action="store_true",
+                      help="J1939 の信号名・単位・更新周期で出力する")
     p_dl.set_defaults(func=cmd_demo_log)
+
+    p_ins = sub.add_parser("inspect", help="ログの信号構成とサンプルレートを診断")
+    p_ins.add_argument("--log", required=True)
+    p_ins.add_argument("--save", default=None, help="診断結果の CSV 出力先")
+    p_ins.set_defaults(func=cmd_inspect)
 
     p_ol = sub.add_parser("ollama", help="Ollama の接続確認")
     p_ol.add_argument("--config", default=None)

@@ -36,6 +36,19 @@ def test_demo_log_and_ingest(tmp_path, capsys):
     assert (tmp_path / "ing" / "figures" / "log_overview.png").exists()
 
 
+def test_j1939_demo_log_inspect_and_ingest(tmp_path, capsys):
+    log = tmp_path / "j1939.csv"
+    assert main(["demo-log", "--j1939", "--out", str(log), "--seed", "5"]) == 0
+    assert main(["inspect", "--log", str(log), "--save", str(tmp_path / "ch.csv")]) == 0
+    printed = capsys.readouterr().out
+    assert "SPN" in printed and "574" in printed
+    assert (tmp_path / "ch.csv").exists()
+
+    assert main(["ingest", "--log", str(log), "--out", str(tmp_path / "ing")]) == 0
+    kpi = pd.read_csv(tmp_path / "ing" / "tables" / "log_events.csv")
+    assert (kpi["detection_source"] == "shift_in_process").all()
+
+
 def test_report_command_uses_fallback(tmp_path):
     summary = {
         "dataset": {"n_events": 1, "upshift_ratio": 1.0, "speed_range_kmh": [10, 20],
