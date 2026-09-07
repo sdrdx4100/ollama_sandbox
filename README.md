@@ -121,6 +121,7 @@ Optuna(NSGA-II, 150 試行)による適合最適化のベースライン比:
 | `amtlab calibrate --trials 200 --mode pareto` | 適合値の多目的最適化のみ |
 | `amtlab inspect --log logs/` | ログの信号構成・サンプルレート診断(複数ファイル可) |
 | `amtlab ingest --log logs/` | 実車ログから変速イベントを切り出して KPI 化(複数ファイル可) |
+| `amtlab compare --group "A社=logs/A" --group "B社=logs/B"` | グループ間の比較(統計・条件補正つき) |
 | `amtlab demo-log --j1939` | J1939 形式のデモログ生成 |
 | `amtlab report --summary outputs/summary.json` | レポートだけ再生成(モデル差し替え検証に) |
 | `amtlab ollama` | Ollama の疎通確認 |
@@ -309,6 +310,82 @@ print(signal_presence("logs/"))   # データ本体は読まずに信号の有�
 
 時刻列は datetime / timedelta / 秒 / ミリ秒 のいずれでも自動で秒に揃えます。
 
+### A 社 vs B 社 を比較する
+
+グループごとにログの置き場を指定すると、KPI の差を統計付きで出します。
+
+```bash
+amtlab compare --group "A社=logs/A" --group "B社=logs/B" --reference A社 --out outputs
+```
+
+```
+基準グループ: A社
+
+⚠ 比較可能性の注意:
+  - 運転条件の共通サポートが 34% しかありません。層別(per_gear)と
+    条件補正後の差(adjusted_diff)を優先してください
+
+               kpi group  n  median_ref  median_group   diff  diff_pct  ci_low  ci_high  adjusted_diff    verdict
+      shift_time_s    B社 40      0.7400        1.0800  0.340      45.9   0.290    0.390         0.303 悪化(効果量: 大)
+    speed_loss_kmh    B社 40      4.2751        5.5334  1.258      29.4  -0.117    2.239         0.807 差は有意でない
+torque_interrupt_s    B社 40      0.6550        0.7700  0.115      17.6   0.030    0.190         0.077 悪化(効果量: 小)
+          jerk_rms    B社 40      4.0035        3.5226 -0.481     -12.0  -1.116   -0.011        -0.679 改善(効果量: 小)
+```
+
+#### 素朴に平均を比べてはいけない理由
+
+このツールが単純な平均比較をしないのは、実データで必ず踏む罠が 2 つあるからです。
+
+**1. 運転条件が揃っていない**
+
+A 社のログが発進加速中心、B 社が高速巡航中心なら、変速時間の差は制御の差ではなく
+**走らせ方の差**です。そこで 3 通りの見方を並べます。
+
+| 見方 | 出力 | 意味 |
+| --- | --- | --- |
+| 素の差 | `diff` | 実際に観測された差(条件の偏りを含む) |
+| 層別 | `group_per_gear.csv` | 同じカレントギア・同じ方向どうしの差 |
+| 条件補正後 | `adjusted_diff` | **同じ運転条件に揃えたときの差**(標準化) |
+
+`adjusted_diff` は「条件 + グループ」から KPI を学習し、同じ条件集合に対して
+グループだけ入れ替えて予測した差の平均です(G-computation)。
+素の差と条件補正後が食い違ったら、条件の偏りを疑ってください。
+運転条件のカバー範囲は `condition_overlap.png` で目視できます。
+
+**2. イベントが独立でない**
+
+1 走行(1 ファイル)から複数の変速イベントが出るので、イベント単位で検定すると
+n を過大に見積もり、差が実際より有意に見えます。信頼区間は
+**ファイル単位のブートストラップ**で出しています。
+
+さらに、統計以前の問題として **KPI の定義が揃っているか**を先に検証します。
+A 社に SPN 574 があって B 社に無ければ、変速時間の起点が違う(約 0.4 秒の系統差)ので
+比較は成立しません。この場合は比較表より先に警告が出ます。
+
+出力:
+
+| ファイル | 内容 |
+| --- | --- |
+| `tables/group_comparison.csv` | KPI ごとの差・CI・効果量・条件補正後の差 |
+| `tables/group_per_gear.csv` | カレントギア別の層別比較 |
+| `tables/condition_overlap.csv` | 運転条件の重なり |
+| `figures/effect_sizes.png` | 差と信頼区間(フォレストプロット) |
+| `figures/condition_overlap.png` | グループ別の運転条件カバー範囲 |
+| `comparison_report.md` | Ollama(不可ならテンプレート)による比較レポート |
+
+Python からも同じことができます。
+
+```python
+from amtlab.batch import analyze_logs
+from amtlab.compare import compare_groups
+
+batch = analyze_logs({"A社": "logs/A", "B社": "logs/B"}, n_jobs=8)
+result = compare_groups(batch.events, reference="A社", files=batch.files)
+print(result.summary())
+```
+
+3 グループ以上でも動きます(基準グループとの差を各グループについて出します)。
+
 ### 手元にログが無いとき
 
 J1939 形式のデモログ(信号名・単位・PGN ごとの更新周期・分解能を模擬)を作れます。
@@ -372,6 +449,7 @@ CI や LLM 無し環境でもパイプラインは止まりません。
 | `amtlab.features` | 変速品質 KPI の抽出・カレントギア別集計・目的関数 |
 | `amtlab.j1939` | J1939 信号の定義・自動検出・物理量変換・レート診断 |
 | `amtlab.batch` | 複数ログ(parquet/CSV)の一括読み込みと突き合わせ |
+| `amtlab.compare` | グループ間比較(層別・条件補正・クラスタブートストラップ) |
 | `amtlab.ingest` | 実車ログの取り込み・イベント切り出し |
 | `amtlab.modeling` | scikit-learn 代理モデル・感度解析 |
 | `amtlab.tuning` | Optuna によるハイパーパラメータ探索 |
@@ -386,7 +464,7 @@ CI や LLM 無し環境でもパイプラインは止まりません。
 
 ```bash
 pip install -e ".[dev]"
-pytest -q          # 172 tests / 1.5 分程度
+pytest -q          # 202 tests / 1.5 分程度
 ruff check src tests
 ```
 

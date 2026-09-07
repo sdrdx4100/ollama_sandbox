@@ -73,6 +73,49 @@ def test_batch_ingest_over_a_directory(tmp_path, capsys):
     assert (out / "figures" / "file_comparison.png").exists()
 
 
+def test_compare_command(tmp_path, capsys):
+    pytest.importorskip("pyarrow")
+    from amtlab.ingest import make_j1939_demo_log
+    from amtlab.simulation import ShiftControlParams
+
+    for company, rate in (("A", 9.0), ("B", 1.6)):
+        directory = tmp_path / company
+        directory.mkdir()
+        controls = [ShiftControlParams(clutch_close_rate=rate)] * 3
+        for i in range(4):
+            make_j1939_demo_log(n_shifts=3, seed=i, controls=controls).to_parquet(
+                directory / f"{company}_{i}.parquet", index=False
+            )
+
+    out = tmp_path / "cmp"
+    code = main([
+        "compare", "--group", f"A={tmp_path / 'A'}", "--group", f"B={tmp_path / 'B'}",
+        "--reference", "A", "--out", str(out), "--boot", "50", "--jobs", "1",
+        "--no-ollama",
+    ])
+    assert code == 0
+    printed = capsys.readouterr().out
+    assert "基準グループ: A" in printed
+
+    table = pd.read_csv(out / "tables" / "group_comparison.csv")
+    assert set(table["group"]) == {"B"}
+    shift = table[table["kpi"] == "shift_time_s"].iloc[0]
+    assert shift["diff"] > 0
+    assert (out / "figures" / "effect_sizes.png").exists()
+    assert (out / "comparison_report.md").exists()
+    assert "グループ比較" in (out / "comparison_report.md").read_text(encoding="utf-8")
+
+
+def test_compare_requires_two_groups(tmp_path):
+    with pytest.raises(SystemExit):
+        main(["compare", "--group", f"A={tmp_path}", "--out", str(tmp_path / "o")])
+
+
+def test_compare_rejects_malformed_group_spec(tmp_path):
+    with pytest.raises(SystemExit):
+        main(["compare", "--group", "no-equals-sign", "--out", str(tmp_path / "o")])
+
+
 def test_report_command_uses_fallback(tmp_path):
     summary = {
         "dataset": {"n_events": 1, "upshift_ratio": 1.0, "speed_range_kmh": [10, 20],

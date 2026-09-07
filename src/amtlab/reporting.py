@@ -252,3 +252,115 @@ def write_report(text: str, path: str | Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return path
+
+
+COMPARISON_INSTRUCTION = """以下は AMT 変速品質の **グループ間比較** の結果(JSON)です。
+Markdown で技術レポートを書いてください。構成は次の通りです。
+
+1. 結論(3行以内。どちらが良いか、断定できるかできないか)
+2. 比較可能性の検証 — 運転条件は揃っているか、KPI の定義は揃っているか
+3. KPI ごとの差 — 素の差と条件補正後の差、信頼区間
+4. カレントギア別に見たときの差
+5. 次に確認すべきこと
+
+重要な注意:
+- 信頼区間が 0 をまたぐ差を「差がある」と書かないこと
+- 素の差と条件補正後(adjusted_diff)が食い違う場合は、運転条件の偏りを
+  疑うべきであり、条件補正後の値を優先すること
+- comparability に警告がある場合は、それを結論より先に述べること
+- 数値は JSON の値をそのまま引用し、単位を明記すること
+"""
+
+
+def build_comparison_summary(comparison, batch=None) -> dict[str, Any]:
+    """グループ比較の結果を JSON 化可能なサマリにする。"""
+
+    summary: dict[str, Any] = {
+        "reference_group": comparison.reference,
+        "groups": list(comparison.groups),
+        "comparability_warnings": list(comparison.comparability),
+        "kpi_comparison": comparison.table.to_dict(orient="records"),
+    }
+    if len(comparison.per_gear):
+        summary["by_current_gear"] = comparison.per_gear.to_dict(orient="records")
+    if batch is not None and len(batch.files):
+        files = batch.files
+        group_col = "group" if "group" in files.columns else None
+        summary["logs"] = {
+            "n_files": int(len(files)),
+            "n_failed": int((files["error"] != "").sum()),
+            "per_group": (
+                files[files["error"] == ""].groupby(group_col).size().to_dict()
+                if group_col
+                else {}
+            ),
+        }
+    return summary
+
+
+def fallback_comparison_report(summary: dict[str, Any]) -> str:
+    """Ollama が使えない場合のグループ比較レポート。"""
+
+    lines = [
+        "# AMT 変速品質 グループ比較レポート",
+        "",
+        "> Ollama に接続できなかったため、テンプレートによる自動生成レポートです。",
+        "",
+        f"基準グループ: **{summary['reference_group']}** / "
+        f"比較対象: {', '.join(map(str, summary['groups']))}",
+        "",
+    ]
+    if summary.get("comparability_warnings"):
+        lines += ["## 比較可能性の注意", ""]
+        lines += [f"- {w}" for w in summary["comparability_warnings"]]
+        lines.append("")
+
+    lines += [
+        "## KPI ごとの差",
+        "",
+        "| KPI | グループ | 基準中央値 | 比較中央値 | 差 | 95% CI | 条件補正後 | 判定 |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for row in summary.get("kpi_comparison", []):
+        lines.append(
+            f"| {row['kpi']} | {row['group']} | {row['median_ref']} | "
+            f"{row['median_group']} | {row['diff']} | "
+            f"[{row['ci_low']}, {row['ci_high']}] | {row.get('adjusted_diff')} | "
+            f"{row['verdict']} |"
+        )
+    lines += [
+        "",
+        "※ 95% CI はファイル(走行)単位のブートストラップ。0 をまたぐ差は",
+        "有意とみなさないこと。条件補正後の差は運転条件を揃えたときの推定値。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def generate_comparison_report(
+    summary: dict[str, Any],
+    client: OllamaClient | None = None,
+    enabled: bool = True,
+) -> tuple[str, str]:
+    """グループ比較レポートを生成する(Ollama、不可ならテンプレート)。"""
+
+    if not enabled:
+        return fallback_comparison_report(summary), "fallback"
+    client = client or OllamaClient()
+    if not client.is_available():
+        return fallback_comparison_report(summary), "fallback"
+    prompt = (
+        COMPARISON_INSTRUCTION
+        + "\n```json\n"
+        + json.dumps(summary, ensure_ascii=False, indent=2, default=str)
+        + "\n```\n"
+    )
+    try:
+        text = client.chat(prompt)
+    except Exception as exc:  # pragma: no cover - ネットワーク依存
+        return (
+            fallback_comparison_report(summary)
+            + f"\n\n> Ollama 生成に失敗しました: {type(exc).__name__}: {exc}\n",
+            "fallback",
+        )
+    return (text, "ollama") if text else (fallback_comparison_report(summary), "fallback")

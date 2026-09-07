@@ -710,6 +710,7 @@ def make_j1939_demo_log(
     sample_hz: float = 100.0,
     seed: int = 0,
     naming: str = "short",
+    controls: list | None = None,
 ) -> pd.DataFrame:
     """シミュレーション結果を **J1939 の信号名・単位・更新周期** に変換した
     デモログを作る。取り込み経路(自動検出 → イベント切り出し)の確認用。
@@ -742,10 +743,10 @@ def make_j1939_demo_log(
     gear = int(start_gear)
     t_offset = 0.0
 
-    for _ in range(n_shifts):
+    for i in range(n_shifts):
         if gear + 1 > trm.n_gears():
             break
-        control = ShiftControlParams.sample(rng)
+        control = controls[i % len(controls)] if controls else ShiftControlParams.sample(rng)
         scenario = ShiftScenario(
             gear, gear + 1, speed_kmh=speed, throttle=float(rng.uniform(0.4, 0.9))
         )

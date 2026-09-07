@@ -126,6 +126,88 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_groups(specs: list[str]) -> dict[str, str]:
+    """``"A社=logs/a"`` の並びを {グループ: パターン} にする。"""
+    groups: dict[str, str] = {}
+    for spec in specs:
+        name, sep, pattern = spec.partition("=")
+        if not sep or not pattern:
+            raise SystemExit(f"--group は 名前=パス の形式で指定してください: {spec!r}")
+        if name.strip() in groups:
+            raise SystemExit(f"グループ名が重複しています: {name.strip()!r}")
+        groups[name.strip()] = pattern.strip()
+    return groups
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    """グループ(A 社 / B 社 など)ごとにログを集めて比較する。"""
+    from . import viz
+    from .batch import analyze_logs, signal_presence
+    from .compare import compare_groups
+    from .config import PipelineConfig
+    from .reporting import (
+        OllamaClient,
+        build_comparison_summary,
+        generate_comparison_report,
+        write_report,
+    )
+
+    groups = _parse_groups(args.group)
+    if len(groups) < 2:
+        raise SystemExit("--group は 2 つ以上指定してください")
+
+    sm = _signal_map_from_args(args)
+    batch = analyze_logs(groups, sm, resample_hz=args.resample_hz, n_jobs=args.jobs)
+    print(batch.summary())
+    if batch.events.empty:
+        print("\n変速イベントを検出できませんでした")
+        return 1
+
+    out = Path(args.out)
+    (out / "tables").mkdir(parents=True, exist_ok=True)
+    batch.events.to_csv(out / "tables" / "group_events.csv", index=False)
+    batch.files.to_csv(out / "tables" / "group_files.csv", index=False)
+
+    comparison = compare_groups(
+        batch.events, reference=args.reference, files=batch.files,
+        n_boot=args.boot, seed=args.seed,
+    )
+    comparison.table.to_csv(out / "tables" / "group_comparison.csv", index=False)
+    if len(comparison.per_gear):
+        comparison.per_gear.to_csv(out / "tables" / "group_per_gear.csv", index=False)
+    if len(comparison.overlap):
+        comparison.overlap.to_csv(out / "tables" / "condition_overlap.csv", index=False)
+    signal_presence(groups, sm).to_csv(out / "tables" / "signal_presence.csv", index=False)
+
+    print()
+    print(comparison.summary())
+
+    figures = [
+        viz.plot_group_comparison(batch.events, out / "figures"),
+        viz.plot_effect_sizes(comparison.table, out / "figures"),
+        viz.plot_condition_overlap(batch.events, out / "figures"),
+    ]
+    if len(comparison.per_gear):
+        figures.append(viz.plot_group_by_gear(comparison.per_gear, out / "figures"))
+    print()
+    for path in figures:
+        print(f"figure: {path}")
+
+    cfg = PipelineConfig.load(args.config)
+    client = OllamaClient(host=cfg.ollama.host, model=cfg.ollama.model,
+                          temperature=cfg.ollama.temperature, timeout_s=cfg.ollama.timeout_s)
+    summary = build_comparison_summary(comparison, batch)
+    (out / "comparison_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
+    text, source = generate_comparison_report(
+        summary, client=client, enabled=cfg.ollama.enabled and not args.no_ollama
+    )
+    report = write_report(text, out / "comparison_report.md")
+    print(f"report: {report} (source: {source})")
+    return 0
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     from .config import PipelineConfig
     from .reporting import OllamaClient, generate_report, write_report
@@ -361,6 +443,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_cal.add_argument("--trials", type=int, default=None)
     p_cal.add_argument("--mode", choices=["scalar", "pareto"], default=None)
     p_cal.set_defaults(func=cmd_calibrate)
+
+    p_cmp = sub.add_parser("compare", help="グループ間(A社 vs B社 など)でログを比較")
+    p_cmp.add_argument("--group", required=True, action="append", metavar="名前=パス",
+                       help='比較するグループ (例: --group "A社=logs/a" '
+                            '--group "B社=logs/b")。2 つ以上指定する')
+    p_cmp.add_argument("--reference", default=None, help="基準グループ名(既定は先頭)")
+    p_cmp.add_argument("--out", default="outputs")
+    p_cmp.add_argument("--config", default=None)
+    p_cmp.add_argument("--jobs", type=int, default=-1)
+    p_cmp.add_argument("--boot", type=int, default=1000,
+                       help="ファイル単位ブートストラップの反復回数")
+    p_cmp.add_argument("--seed", type=int, default=0)
+    p_cmp.add_argument("--resample-hz", type=float, default=100.0)
+    p_cmp.add_argument("--map", default=None,
+                       help="{内部名: 列名} の YAML/JSON で自動検出を上書き")
+    p_cmp.add_argument("--no-auto", action="store_true")
+    p_cmp.add_argument("--no-ollama", action="store_true")
+    for name, default in (("col_time", "time"), ("col_engine_speed", "engine_speed_rpm"),
+                          ("col_speed", "speed_kmh"), ("col_gear", "gear"),
+                          ("col_throttle", "throttle"), ("col_torque", "shaft_torque")):
+        p_cmp.add_argument(f"--{name.replace('_', '-')}", default=default)
+    p_cmp.set_defaults(func=cmd_compare)
 
     p_rep = sub.add_parser("report", help="summary.json からレポートを再生成")
     p_rep.add_argument("--config", default=None)

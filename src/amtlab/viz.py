@@ -485,3 +485,93 @@ def plot_signal_presence(presence: pd.DataFrame, outdir: Path | str,
     ax.tick_params(axis="x", labelrotation=90, labelsize=8)
     ax.tick_params(axis="y", labelsize=7)
     return _save(fig, outdir, name)
+
+
+def plot_group_comparison(events: pd.DataFrame, outdir: Path | str,
+                          name: str = "group_comparison",
+                          group_col: str = "group") -> Path:
+    """グループ(A 社 / B 社 など)ごとの KPI 分布。"""
+    set_style()
+    kpis = [c for c in ("shift_time_s", "speed_drop_kmh", "speed_loss_kmh",
+                        "torque_interrupt_s", "jerk_rms") if c in events.columns]
+    long = events.melt(id_vars=[group_col], value_vars=kpis,
+                       var_name="kpi", value_name="value")
+    g = sns.catplot(
+        data=long, x=group_col, y="value", hue=group_col, col="kpi",
+        kind="violin", col_wrap=3, height=2.9, aspect=1.1, cut=0,
+        density_norm="width", sharey=False, legend=False, inner="quartile",
+    )
+    g.set_titles("{col_name}")
+    g.set_axis_labels("", "")
+    g.figure.suptitle("KPI distribution by group", y=1.03)
+    return _save(g.figure, outdir, name)
+
+
+def plot_effect_sizes(table: pd.DataFrame, outdir: Path | str,
+                      name: str = "effect_sizes") -> Path:
+    """基準グループとの差と信頼区間(フォレストプロット)。
+
+    素の差(ファイル単位ブートストラップの 95% CI)と、運転条件を揃えた
+    補正後の差を並べて描く。両者が食い違うときは条件の偏りを疑う。
+    """
+    set_style()
+    kpis = list(dict.fromkeys(table["kpi"]))
+    n_rows = max(int(table["group"].nunique()), 1)
+    height = max(2.6, 1.4 + 0.55 * n_rows)
+    fig, axes = plt.subplots(1, len(kpis), figsize=(3.1 * len(kpis), height), squeeze=False)
+    for ax, kpi in zip(axes[0], kpis):
+        block = table[table["kpi"] == kpi]
+        y = np.arange(len(block))
+        low = block["diff"] - block["ci_low"]
+        high = block["ci_high"] - block["diff"]
+        ax.errorbar(block["diff"], y, xerr=[low, high], fmt="o", color="#4c72b0",
+                    capsize=4, lw=1.4, markersize=7, label="raw (95% CI)")
+        if "adjusted_diff" in block.columns and block["adjusted_diff"].notna().any():
+            ax.scatter(block["adjusted_diff"], y, marker="D", color="#dd8452",
+                       zorder=5, s=42, label="condition-adjusted")
+        ax.axvline(0.0, color="0.35", lw=1.1, ls="--")
+        ax.set_yticks(y)
+        ax.set_yticklabels(block["group"])
+        ax.set_title(kpi, fontsize=10)
+        ax.set_xlabel("difference vs reference")
+    axes[0][0].legend(fontsize=8, loc="best")
+    fig.suptitle("Difference from the reference group (right = worse)", y=1.02)
+    fig.tight_layout()
+    return _save(fig, outdir, name)
+
+
+def plot_condition_overlap(events: pd.DataFrame, outdir: Path | str,
+                           name: str = "condition_overlap",
+                           group_col: str = "group") -> Path:
+    """グループごとの運転条件のカバー範囲(比較の公平性チェック)。"""
+    set_style()
+    d = events.dropna(subset=["speed_kmh"]).copy()
+    has_throttle = "throttle" in d.columns and d["throttle"].notna().any()
+    g = sns.JointGrid(height=5.5)
+    for group, block in d.groupby(group_col, observed=True):
+        y = block["throttle"] if has_throttle else block["current_gear"]
+        g.ax_joint.scatter(block["speed_kmh"], y, alpha=0.55, s=32, label=str(group))
+        sns.kdeplot(x=block["speed_kmh"], ax=g.ax_marg_x, fill=True, alpha=0.35)
+        sns.kdeplot(y=y, ax=g.ax_marg_y, fill=True, alpha=0.35)
+    g.ax_joint.set_xlabel("vehicle speed [km/h]")
+    g.ax_joint.set_ylabel("throttle [-]" if has_throttle else "current gear")
+    g.ax_joint.legend(title="group")
+    g.figure.suptitle("Operating-condition coverage per group", y=1.01)
+    return _save(g.figure, outdir, name)
+
+
+def plot_group_by_gear(per_gear: pd.DataFrame, outdir: Path | str,
+                       name: str = "group_by_gear", kpi: str | None = None) -> Path:
+    """カレントギア別の差(層別比較)。"""
+    set_style()
+    kpi = kpi or per_gear["kpi"].iloc[0]
+    block = per_gear[per_gear["kpi"] == kpi]
+    g = sns.catplot(
+        data=block, x="current_gear", y="diff", hue="group", col="direction",
+        kind="bar", height=3.4, aspect=1.3, sharey=True,
+    )
+    for ax in g.axes.flat:
+        ax.axhline(0.0, color="0.35", lw=1.1)
+    g.set_axis_labels("current gear", f"{kpi} difference vs reference")
+    g.figure.suptitle(f"{kpi}: difference by current gear", y=1.03)
+    return _save(g.figure, outdir, name)

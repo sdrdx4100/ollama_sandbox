@@ -34,7 +34,9 @@ def iter_log_paths(patterns: str | Path | list[str | Path]) -> list[Path]:
     ディレクトリを渡した場合は再帰的に対応拡張子のファイルを集める。
     """
 
-    if isinstance(patterns, (str, Path)):
+    if isinstance(patterns, dict):  # {グループ: パターン} はまとめて展開
+        patterns = list(patterns.values())
+    elif isinstance(patterns, (str, Path)):
         patterns = [patterns]
 
     found: list[Path] = []
@@ -70,6 +72,32 @@ def _require_pyarrow(module: str):
             "parquet / feather の読み込みには pyarrow が必要です: "
             'pip install "amtlab[parquet]"'
         ) from exc
+
+
+def iter_log_groups(
+    patterns: "str | Path | list | dict[str, object]",
+) -> list[tuple[str, Path]]:
+    """``{"A社": "logs/a/", "B社": "logs/b/"}`` を (グループ, パス) に展開する。
+
+    dict でなければグループ名は空文字になる。同じファイルが複数グループに
+    現れた場合はエラーにする(取り違えると比較が壊れるため)。
+    """
+
+    if not isinstance(patterns, dict):
+        return [("", path) for path in iter_log_paths(patterns)]
+
+    pairs: list[tuple[str, Path]] = []
+    seen: dict[Path, str] = {}
+    for group, spec in patterns.items():
+        for path in iter_log_paths(spec):
+            if path in seen and seen[path] != group:
+                raise ValueError(
+                    f"同じファイルが複数グループに含まれています: {path} "
+                    f"({seen[path]} と {group})"
+                )
+            seen[path] = str(group)
+            pairs.append((str(group), path))
+    return pairs
 
 
 def read_log_schema(path: str | Path) -> list[str]:
@@ -122,6 +150,7 @@ class FileReport:
     """1 ファイル分の読み込み結果。"""
 
     path: str
+    group: str = ""
     n_rows: int = 0
     duration_s: float = 0.0
     n_events: int = 0
@@ -181,8 +210,9 @@ def _analyze_one(
     vehicle: VehicleParams | None,
     resample_hz: float | None,
     settle_time: float,
+    group: str = "",
 ) -> tuple[FileReport, pd.DataFrame]:
-    report = FileReport(path=str(path))
+    report = FileReport(path=str(path), group=group)
     try:
         df, mapping = load_log(path, signal_map)
         report.n_rows = len(df)
@@ -197,6 +227,8 @@ def _analyze_one(
         if len(kpi):
             kpi.insert(0, "source_file", path.name)
             kpi.insert(1, "source_path", str(path))
+            if group:
+                kpi.insert(0, "group", group)
             report.detection_source = str(kpi["detection_source"].iloc[0])
         report.n_events = len(kpi)
         return report, kpi
@@ -206,7 +238,7 @@ def _analyze_one(
 
 
 def analyze_logs(
-    patterns: str | Path | list[str | Path],
+    patterns: "str | Path | list | dict[str, object]",
     signal_map: SignalMap | None = None,
     vehicle: VehicleParams | None = None,
     resample_hz: float | None = 100.0,
@@ -217,15 +249,19 @@ def analyze_logs(
 
     時系列はファイルごとに捨てるので、ファイル数を増やしてもメモリは
     イベント数にしか比例しない。
+
+    ``patterns`` に ``{"A社": "logs/a/", "B社": "logs/b/"}`` のような dict を
+    渡すと、イベント表に ``group`` 列が付き :mod:`amtlab.compare` で
+    グループ比較できる。
     """
 
-    paths = iter_log_paths(patterns)
-    if not paths:
+    pairs = iter_log_groups(patterns)
+    if not pairs:
         return BatchResult(warnings=[f"ログが見つかりません: {patterns}"])
 
     results = Parallel(n_jobs=n_jobs, prefer="processes")(
-        delayed(_analyze_one)(p, signal_map, vehicle, resample_hz, settle_time)
-        for p in paths
+        delayed(_analyze_one)(p, signal_map, vehicle, resample_hz, settle_time, g)
+        for g, p in pairs
     )
     reports = [r for r, _ in results]
     frames = [k for _, k in results if len(k)]
@@ -240,6 +276,13 @@ def analyze_logs(
 
     result = BatchResult(events=events, files=files)
     result.warnings = _batch_warnings(reports, events)
+    if "group" in events.columns:
+        per_group = events.groupby("group")["source_file"].nunique()
+        result.warnings.insert(
+            0,
+            "グループ別ファイル数: "
+            + ", ".join(f"{g}={n}" for g, n in per_group.items()),
+        )
     return result
 
 
@@ -281,19 +324,23 @@ def _batch_warnings(reports: list[FileReport], events: pd.DataFrame) -> list[str
 
 
 def signal_presence(
-    patterns: str | Path | list[str | Path], signal_map: SignalMap | None = None
+    patterns: "str | Path | list | dict[str, object]",
+    signal_map: SignalMap | None = None,
 ) -> pd.DataFrame:
     """ファイル × 信号の有無を表にする(データ本体は読まない)。
 
     ファイルごとに取れている信号が違う場合の差分確認に使う。
+    dict を渡した場合は ``group`` 列が付く。
     """
 
     sm = signal_map or SignalMap()
-    paths = iter_log_paths(patterns)
+    pairs = iter_log_groups(patterns)
     keys = [signal.key for signal in j1939.J1939_CATALOG]
     rows = []
-    for path in paths:
-        row: dict[str, object] = {"file": path.name, "n_columns": 0, "error": ""}
+    for group, path in pairs:
+        row: dict[str, object] = {
+            "file": path.name, "group": group, "n_columns": 0, "error": "",
+        }
         row.update({key: False for key in keys})
         try:
             schema = read_log_schema(path)
@@ -308,7 +355,10 @@ def signal_presence(
         except Exception as exc:
             row["error"] = f"{type(exc).__name__}: {exc}"
         rows.append(row)
+
     frame = pd.DataFrame(rows)
+    if not len(frame):
+        return pd.DataFrame(columns=["file", "group", "n_columns", "error", *keys])
     for key in keys:
         frame[key] = frame[key].astype(bool)
     return frame
