@@ -1,0 +1,37 @@
+# 12 速 AMT トラック向け設定
+# 使い方: amtlab run --config configs/truck12.yaml
+output_dir: outputs/truck12
+vehicle: truck12        # 12速 / 空車16t / 13Lディーゼル(2300 Nm)
+
+dataset:
+  n_samples: 600        # 段数が多いぶん条件も広い。必要なら増やす
+  seed: 0
+  n_jobs: -1
+
+model:
+  targets: [shift_time_s, speed_drop_kmh, speed_loss_kmh, jerk_rms]
+  primary_target: shift_time_s
+  n_trials: 40
+  n_splits: 5
+  model_names: [hist_gbr, random_forest, extra_trees, ridge]
+  permutation_repeats: 10
+
+calibration:
+  n_trials: 150
+  mode: pareto
+  seed: 0
+  use_surrogate: false
+  worst_case_weight: 0.3
+  objectives: [shift_time_s, speed_loss_kmh, jerk_rms]
+  weights:
+    shift_time_s: 0.40
+    speed_loss_kmh: 0.40
+    jerk_rms: 0.20
+
+ollama:
+  enabled: true
+  host: http://localhost:11434
+  model: qwen2.5:7b
+  temperature: 0.3
+  timeout_s: 180
+  language: ja

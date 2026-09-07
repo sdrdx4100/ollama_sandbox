@@ -79,8 +79,17 @@ class TransmissionParams:
     def n_gears(self) -> int:
         return len(self.gear_ratios)
 
+    def has_gear(self, gear: int) -> bool:
+        """その段が存在するか(ログのギヤ位置が段数を超える場合がある)。"""
+        return isinstance(gear, (int, np.integer)) and 1 <= int(gear) <= self.n_gears()
+
     def total_ratio(self, gear: int) -> float:
         """gear は 1 始まり。総減速比 i_g * i_f。"""
+        if not self.has_gear(gear):
+            raise IndexError(
+                f"{gear} 速はこの変速機({self.n_gears()} 段)にありません。"
+                "車両プリセットを合わせてください(例: truck_12speed())"
+            )
         return self.gear_ratios[gear - 1] * self.final_drive
 
     def clutch_capacity_at(self, position: float) -> float:
@@ -142,3 +151,80 @@ class VehicleParams:
         if gear is not None:
             j += self.transmission.input_inertia * self.transmission.total_ratio(gear) ** 2
         return j
+
+
+# ----------------------------------------------------------------------
+# 車両プリセット
+# ----------------------------------------------------------------------
+def passenger_6speed() -> VehicleParams:
+    """乗用車 + 6 速 AMT(既定値)。"""
+    return VehicleParams()
+
+
+def truck_12speed() -> VehicleParams:
+    """大型トラック(トラクタ + セミトレーラ)+ 12 速 AMT。
+
+    欧州系 12 速 AMT(オーバードライブ無し、トップ 1.00)を想定した代表値。
+    実車に当てる場合は、少なくとも次を実測で同定すること。
+
+      * 変速機の各段比と終減速比(SPN 526 のログから確認できる)
+      * 車両総重量(積車 / 空車で大きく変わる)
+      * 駆動系のねじり剛性・減衰(シャッフル周波数を合わせる)
+      * クラッチ伝達容量とアクチュエータ応答
+    """
+
+    engine = EngineParams(
+        # 13 L ディーゼル: 低回転で高トルク、常用域が狭い
+        wot_rpm=(600, 900, 1200, 1400, 1600, 1800, 2100),
+        wot_torque=(1200, 2300, 2300, 2300, 2050, 1800, 1200),
+        drag_offset=60.0,
+        drag_slope=0.05,
+        idle_rpm=600.0,
+        max_rpm=2100.0,
+        inertia=2.6,  # フライホイールが大きい
+        torque_time_constant=0.10,
+    )
+    transmission = TransmissionParams(
+        gear_ratios=(14.94, 11.73, 9.04, 7.09, 5.54, 4.35,
+                     3.44, 2.70, 2.08, 1.63, 1.27, 1.00),
+        final_drive=3.40,
+        efficiency=0.96,
+        input_inertia=0.50,
+        clutch_capacity=3000.0,
+        clutch_kiss_point=0.35,
+        clutch_curve_exponent=1.6,
+        lock_slip_tol=2.0,
+        gear_out_time=0.10,
+        gear_in_time=0.15,
+    )
+    driveline = DrivelineParams(stiffness=60000.0, damping=1200.0, wheel_inertia=40.0)
+    return VehicleParams(
+        mass=16000.0,  # 空車(トラクタ + 空トレーラ)
+        payload=0.0,
+        wheel_radius=0.52,  # 315/80R22.5 相当
+        drag_area=6.0,  # Cd*A(トラクタ + セミトレーラ)
+        rolling_resistance=0.006,
+        engine=engine,
+        transmission=transmission,
+        driveline=driveline,
+    )
+
+
+#: 名前で引ける車両プリセット
+VEHICLE_PRESETS = {
+    "passenger6": passenger_6speed,
+    "truck12": truck_12speed,
+}
+
+
+def get_vehicle(name: str | VehicleParams | None) -> VehicleParams:
+    """プリセット名から車両パラメータを取得する。"""
+    if name is None:
+        return VehicleParams()
+    if isinstance(name, VehicleParams):
+        return name
+    if name not in VEHICLE_PRESETS:
+        raise KeyError(
+            f"未知の車両プリセット: {name} (選択肢: {sorted(VEHICLE_PRESETS)})"
+        )
+    return VEHICLE_PRESETS[name]()

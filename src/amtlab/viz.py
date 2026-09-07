@@ -575,3 +575,80 @@ def plot_group_by_gear(per_gear: pd.DataFrame, outdir: Path | str,
     g.set_axis_labels("current gear", f"{kpi} difference vs reference")
     g.figure.suptitle(f"{kpi}: difference by current gear", y=1.03)
     return _save(g.figure, outdir, name)
+
+
+def plot_clutch_actuation(events: pd.DataFrame, outdir: Path | str,
+                          name: str = "clutch_actuation",
+                          hue: str | None = None) -> Path:
+    """クラッチの「切っている時間」と「切りの深さ」の関係。
+
+    左上(サイクルが短く、全切り比率が高い)ほど
+    **短時間で済ませながらしっかり切れている**操作。
+    """
+    set_style()
+    needed = {"clutch_cycle_time_s", "clutch_full_release_ratio"}
+    if not needed <= set(events.columns):
+        raise KeyError(f"クラッチ指標がありません: {sorted(needed - set(events.columns))}")
+
+    d = events.dropna(subset=list(needed)).copy()
+    hue = hue or ("group" if "group" in d.columns else "current_gear")
+    d[hue] = d[hue].astype(str) if hue == "group" else d[hue]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
+    sns.scatterplot(data=d, x="clutch_cycle_time_s", y="clutch_full_release_ratio",
+                    hue=hue, size="shift_time_s" if "shift_time_s" in d else None,
+                    sizes=(25, 130), alpha=0.8, ax=axes[0])
+    axes[0].axhline(float(d["clutch_full_release_ratio"].median()), color="0.6",
+                    lw=1, ls="--")
+    axes[0].axvline(float(d["clutch_cycle_time_s"].median()), color="0.6", lw=1, ls="--")
+    axes[0].annotate("short & firm", xy=(0.03, 0.94), xycoords="axes fraction",
+                     fontsize=9, color="#2e7d32")
+    axes[0].annotate("long & shallow", xy=(0.62, 0.06), xycoords="axes fraction",
+                     fontsize=9, color="#c62828")
+    axes[0].set_xlabel("clutch ON-OFF-ON cycle time [s]")
+    axes[0].set_ylabel("full-release ratio [-]")
+    axes[0].set_title("How short, and how firmly, the clutch is pressed")
+
+    if "clutch_mean_slip_pct" in d.columns:
+        sns.scatterplot(data=d, x="clutch_cycle_time_s", y="clutch_mean_slip_pct",
+                        hue=hue, alpha=0.8, ax=axes[1], legend=False)
+        axes[1].set_xlabel("clutch ON-OFF-ON cycle time [s]")
+        axes[1].set_ylabel("mean slip during the cycle [%]")
+        axes[1].set_title("Cycle time vs average slip")
+    fig.tight_layout()
+    return _save(fig, outdir, name)
+
+
+def plot_clutch_profiles(profiles: pd.DataFrame, outdir: Path | str,
+                         name: str = "clutch_profiles",
+                         hue: str | None = None, by_gear: bool = False) -> Path:
+    """変速開始を 0 秒に揃えたクラッチすべり率の重ね描き(中央値と四分位帯)。
+
+    「切り方の形」そのものを比較する図。立ち上がりの速さ、全切りの高さと
+    長さ、繋ぎの傾きが一目で分かる。
+    """
+    set_style()
+    hue = hue or ("group" if "group" in profiles.columns else None)
+    d = profiles.dropna(subset=["clutch_slip_pct"]).copy()
+    if by_gear and "current_gear" in d.columns:
+        g = sns.relplot(
+            data=d, x="rel_time_s", y="clutch_slip_pct", hue=hue,
+            col="current_gear", col_wrap=4, kind="line", estimator="median",
+            errorbar=("pi", 50), height=2.6, aspect=1.2, lw=1.8,
+        )
+        g.set_axis_labels("time from shift start [s]", "clutch slip [%]")
+        g.set_titles("gear {col_name}")
+        g.figure.suptitle("Clutch slip profile by current gear", y=1.03)
+        return _save(g.figure, outdir, name)
+
+    fig, ax = plt.subplots(figsize=(9, 4.6))
+    sns.lineplot(data=d, x="rel_time_s", y="clutch_slip_pct", hue=hue,
+                 estimator="median", errorbar=("pi", 50), lw=2.0, ax=ax)
+    ax.axhline(90.0, color="0.55", lw=1, ls=":")
+    ax.annotate("fully released (90%)", xy=(ax.get_xlim()[1], 90), xytext=(-6, 4),
+                textcoords="offset points", ha="right", fontsize=8, color="0.4")
+    ax.axvline(0.0, color="0.35", lw=1)
+    ax.set_xlabel("time from shift start [s]")
+    ax.set_ylabel("clutch slip [%]")
+    ax.set_title("Clutch release/engage profile (median and interquartile band)")
+    return _save(fig, outdir, name)

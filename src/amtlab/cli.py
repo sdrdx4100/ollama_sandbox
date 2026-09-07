@@ -39,6 +39,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         cfg.calibration.n_trials = args.calib_trials
     if args.mode:
         cfg.calibration.mode = args.mode
+    if args.vehicle:
+        cfg.vehicle = args.vehicle
     if args.no_ollama:
         cfg.ollama.enabled = False
     if args.quick:
@@ -157,7 +159,8 @@ def cmd_compare(args: argparse.Namespace) -> int:
         raise SystemExit("--group は 2 つ以上指定してください")
 
     sm = _signal_map_from_args(args)
-    batch = analyze_logs(groups, sm, resample_hz=args.resample_hz, n_jobs=args.jobs)
+    batch = analyze_logs(groups, sm, vehicle=_vehicle_from_args(args),
+                         resample_hz=args.resample_hz, n_jobs=args.jobs, profiles=True)
     print(batch.summary())
     if batch.events.empty:
         print("\n変速イベントを検出できませんでした")
@@ -187,6 +190,11 @@ def cmd_compare(args: argparse.Namespace) -> int:
         viz.plot_effect_sizes(comparison.table, out / "figures"),
         viz.plot_condition_overlap(batch.events, out / "figures"),
     ]
+    if "clutch_cycle_time_s" in batch.events.columns:
+        figures.append(viz.plot_clutch_actuation(batch.events, out / "figures"))
+    if len(batch.profiles):
+        batch.profiles.to_csv(out / "tables" / "clutch_profiles.csv", index=False)
+        figures.append(viz.plot_clutch_profiles(batch.profiles, out / "figures"))
     if len(comparison.per_gear):
         figures.append(viz.plot_group_by_gear(comparison.per_gear, out / "figures"))
     print()
@@ -239,8 +247,10 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     (out / "tables").mkdir(parents=True, exist_ok=True)
 
     # --- 単一ファイル: 従来どおり時系列も描く ----------------------------
+    vehicle = _vehicle_from_args(args)
     if len(paths) == 1:
-        trace, kpi = analyze_log(paths[0], sm, resample_hz=args.resample_hz)
+        trace, kpi = analyze_log(paths[0], sm, vehicle=vehicle,
+                                 resample_hz=args.resample_hz)
         kpi.to_csv(out / "tables" / "log_events.csv", index=False)
         if kpi.empty:
             print("変速イベントを検出できませんでした(ギヤ信号を確認してください)")
@@ -258,7 +268,8 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
     # --- 複数ファイル: KPI 表に畳んで比較 --------------------------------
     result = analyze_logs(
-        paths, sm, resample_hz=args.resample_hz, n_jobs=args.jobs
+        paths, sm, vehicle=vehicle, resample_hz=args.resample_hz,
+        n_jobs=args.jobs, profiles=True,
     )
     result.files.to_csv(out / "tables" / "log_files.csv", index=False)
     print(result.summary())
@@ -285,9 +296,25 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         viz.plot_kpi_distributions(result.events, out / "figures",
                                    "log_kpi_distributions"),
     ]
+    if "clutch_cycle_time_s" in result.events.columns:
+        figures.append(viz.plot_clutch_actuation(result.events, out / "figures"))
+    if len(result.profiles):
+        result.profiles.to_csv(out / "tables" / "clutch_profiles.csv", index=False)
+        figures.append(viz.plot_clutch_profiles(result.profiles, out / "figures"))
+        figures.append(
+            viz.plot_clutch_profiles(result.profiles, out / "figures",
+                                     "clutch_profiles_by_gear", by_gear=True)
+        )
     for path in figures:
         print(f"figure: {path}")
     return 0
+
+
+def _vehicle_from_args(args: argparse.Namespace):
+    """--vehicle プリセット名を車両パラメータに解決する。"""
+    from .simulation.vehicle import get_vehicle
+
+    return get_vehicle(getattr(args, "vehicle", None) or None)
 
 
 def _signal_map_from_args(args: argparse.Namespace):
@@ -413,6 +440,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--calib-trials", type=int, default=None, help="適合探索の試行数")
     p_run.add_argument("--mode", choices=["scalar", "pareto"], default=None)
     p_run.add_argument("--no-ollama", action="store_true", help="LLM レポートを使わない")
+    p_run.add_argument("--vehicle", default=None, choices=["passenger6", "truck12"],
+                       help="車両プリセット(設定を上書き)")
     p_run.add_argument("--quick", action="store_true", help="動作確認用の小規模実行")
     p_run.set_defaults(func=cmd_run)
 
@@ -456,6 +485,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="ファイル単位ブートストラップの反復回数")
     p_cmp.add_argument("--seed", type=int, default=0)
     p_cmp.add_argument("--resample-hz", type=float, default=100.0)
+    p_cmp.add_argument("--vehicle", default=None, choices=["passenger6", "truck12"],
+                       help="車両プリセット(12速トラックなら truck12)")
     p_cmp.add_argument("--map", default=None,
                        help="{内部名: 列名} の YAML/JSON で自動検出を上書き")
     p_cmp.add_argument("--no-auto", action="store_true")
@@ -486,6 +517,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_in.add_argument("--col-gear", default="gear")
     p_in.add_argument("--col-throttle", default="throttle")
     p_in.add_argument("--col-torque", default="shaft_torque")
+    p_in.add_argument("--vehicle", default=None, choices=["passenger6", "truck12"],
+                      help="車両プリセット(12速トラックなら truck12)")
     p_in.add_argument("--map", default=None,
                       help="{内部名: 列名} の YAML/JSON で自動検出を上書き")
     p_in.add_argument("--no-auto", action="store_true",

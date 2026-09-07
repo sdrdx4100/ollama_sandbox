@@ -145,6 +145,7 @@ def standardize(
     mapping = sm.resolve(df)
     out = j1939.decode(df, mapping)
 
+    slip_source = out.attrs.get("clutch_slip_source")
     if resample_hz:
         dt = 1.0 / resample_hz
         grid = np.arange(out["time"].iloc[0], out["time"].iloc[-1] + dt * 0.5, dt)
@@ -176,6 +177,7 @@ def standardize(
         out["throttle"] = np.nan
     out.attrs["dt"] = dt
     out.attrs["mapping"] = mapping
+    out.attrs["clutch_slip_source"] = slip_source or "SPN 522"
     out.attrs["accel_source"] = accel_source
     out.attrs["jerk_quality"] = jerk_quality
     out.attrs["jerk_cutoff_hz"] = cutoff
@@ -455,6 +457,157 @@ def detect_shift_events(
     return _events_from_gear(trace, veh, settle_time, lock_tol_rpm, lock_tol_pct)
 
 
+#: クラッチが締結しているとみなすすべり率 [%]
+CLUTCH_ENGAGED_PCT = 1.0
+#: クラッチが完全に切れているとみなすすべり率 [%]
+CLUTCH_RELEASED_PCT = 90.0
+
+
+def clutch_metrics(
+    trace: pd.DataFrame,
+    event: ShiftEvent,
+    engaged_pct: float = CLUTCH_ENGAGED_PCT,
+    released_pct: float = CLUTCH_RELEASED_PCT,
+    lead_time: float = 0.2,
+    hold_time: float = 0.05,
+) -> dict[str, float]:
+    """変速中のクラッチ ON→OFF→ON の切り方を測る。
+
+    「変速は短いのにクラッチはしっかり切れている」といった操作の質を
+    数値化するための指標。すべり率(SPN 522)の 1 サイクルを
+
+        締結 → 切り始め(release) → 全切り(open) → 繋ぎ(engage) → 締結
+
+    に分解する。
+
+    Returns
+    -------
+    clutch_cycle_time_s
+        ON→OFF→ON の全体時間。「ギヤチェンジ中の ON-OFF の時間」。
+    clutch_release_time_s / clutch_engage_time_s
+        切り始めから全切りまで / 全切り解除から再締結まで。
+    clutch_open_time_s
+        全切り(すべり率が released_pct 以上)の時間。
+    clutch_full_release_ratio
+        サイクル時間に占める全切り時間の割合。**短時間でもしっかり切って
+        いるか**を表す(1 に近いほど深く切っている)。
+    clutch_mean_slip_pct
+        サイクル平均のすべり率。すべり面積 ÷ サイクル時間。
+    clutch_release_rate_pct_s / clutch_engage_rate_pct_s
+        切り / 繋ぎのアクチュエータ速度。
+    """
+
+    if "clutch_slip_pct" not in trace.columns:
+        return {}
+
+    source = str(trace.attrs.get("clutch_slip_source", "SPN 522"))
+    dt = float(trace.attrs.get("dt", np.median(np.diff(trace["time"]))))
+    window = trace[
+        (trace["time"] >= event.t_start - lead_time) & (trace["time"] <= event.t_settle)
+    ]
+    if len(window) < 5:
+        return {}
+
+    time = window["time"].to_numpy()
+    slip = np.abs(np.nan_to_num(window["clutch_slip_pct"].to_numpy(), nan=0.0))
+    above = slip > engaged_pct
+    if not above.any():
+        return {"clutch_engaged_throughout": 1.0, "clutch_slip_source": source}
+
+    start = int(np.argmax(above))
+    # 締結に戻った点: engaged 以下が hold_time 続いた最初の位置(ノイズ耐性)
+    hold = max(int(round(hold_time / dt)), 1)
+    end = len(slip) - 1
+    below = ~above
+    for i in range(start + 1, len(slip) - hold + 1):
+        if below[i : i + hold].all():
+            end = i
+            break
+
+    cycle = slip[start : end + 1]
+    cycle_time = float(time[end] - time[start])
+    open_mask = cycle >= released_pct
+    open_time = float(open_mask.sum() * dt)
+    integral = float(np.trapezoid(cycle, dx=dt))
+
+    metrics = {
+        "clutch_cycle_time_s": cycle_time,
+        "clutch_open_time_s": open_time,
+        "clutch_full_release_ratio": open_time / cycle_time if cycle_time > 0 else np.nan,
+        "clutch_mean_slip_pct": integral / cycle_time if cycle_time > 0 else np.nan,
+        "clutch_peak_slip_pct": float(np.max(cycle)),
+        "clutch_slip_integral_pct_s": integral,
+        "clutch_engaged_throughout": 0.0,
+        "clutch_slip_source": source,
+    }
+
+    if open_mask.any():
+        first_open = int(np.argmax(open_mask))
+        last_open = len(open_mask) - 1 - int(np.argmax(open_mask[::-1]))
+        release_time = float(time[start + first_open] - time[start])
+        engage_time = float(time[end] - time[start + last_open])
+        metrics.update(
+            {
+                "clutch_release_time_s": release_time,
+                "clutch_engage_time_s": engage_time,
+                "clutch_release_rate_pct_s": (
+                    float(cycle[first_open] - cycle[0]) / release_time
+                    if release_time > 0 else np.nan
+                ),
+                "clutch_engage_rate_pct_s": (
+                    float(cycle[last_open]) / engage_time if engage_time > 0 else np.nan
+                ),
+            }
+        )
+    else:  # 全切りに達していない(半クラのまま変速している)
+        metrics.update(
+            {
+                "clutch_release_time_s": np.nan,
+                "clutch_engage_time_s": np.nan,
+                "clutch_release_rate_pct_s": np.nan,
+                "clutch_engage_rate_pct_s": np.nan,
+            }
+        )
+    return metrics
+
+
+def clutch_profile(
+    trace: pd.DataFrame,
+    event: ShiftEvent,
+    n_points: int = 160,
+    lead_time: float = 0.2,
+    span: float = 2.5,
+) -> pd.DataFrame:
+    """変速開始を 0 秒に揃えたクラッチすべり率の波形(重ね描き用)。
+
+    時系列そのものは捨てても、この短い区間だけ残しておけば
+    「切り方の形」をファイル横断で比較できる。時間軸は
+    ``-lead_time`` 〜 ``span`` の**固定グリッド**なので、イベント長が
+    違っても素直に重ねられる(区間外は NaN)。
+    """
+
+    if "clutch_slip_pct" not in trace.columns:
+        return pd.DataFrame()
+    window = trace[
+        (trace["time"] >= event.t_start - lead_time) & (trace["time"] <= event.t_settle)
+    ]
+    if len(window) < 5:
+        return pd.DataFrame()
+
+    rel = window["time"].to_numpy() - event.t_start
+    grid = np.linspace(-lead_time, span, n_points)
+    inside = (grid >= rel[0]) & (grid <= rel[-1])
+    out = pd.DataFrame({"rel_time_s": grid})
+    for column in ("clutch_slip_pct", "engine_speed_rpm", "speed_kmh"):
+        if column in window.columns:
+            values = np.interp(grid, rel, window[column].to_numpy())
+            out[column] = np.where(inside, values, np.nan)
+    out["event_id"] = event.index
+    out["current_gear"] = event.from_gear
+    out["to_gear"] = event.to_gear
+    return out
+
+
 def event_kpis(trace: pd.DataFrame, event: ShiftEvent,
                vehicle: VehicleParams | None = None) -> dict[str, float]:
     """ログの 1 イベントからシミュレーションと同じ KPI を計算する。
@@ -560,6 +713,7 @@ def event_kpis(trace: pd.DataFrame, event: ShiftEvent,
         slip = np.abs(win["clutch_slip_pct"].to_numpy())
         kpis["clutch_slip_time_s"] = float((slip[after] > 1.0).sum() * dt)
         kpis["clutch_slip_peak_pct"] = float(np.nanmax(slip[after])) if after.any() else np.nan
+        kpis.update(clutch_metrics(trace, event))
 
     kpis["flare_source"] = flare_source
     kpis["detection_source"] = event.source
@@ -573,9 +727,17 @@ def analyze_log(
     vehicle: VehicleParams | None = None,
     resample_hz: float | None = 100.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """ログを読み込み、(整形済み時系列, イベント別 KPI 表) を返す。"""
+    """ログを読み込み、(整形済み時系列, イベント別 KPI 表) を返す。
 
-    df = pd.read_csv(source) if not isinstance(source, pd.DataFrame) else source
+    ``source`` はパス(CSV / parquet / feather)でも DataFrame でもよい。
+    """
+
+    if isinstance(source, pd.DataFrame):
+        df = source
+    else:
+        from .batch import read_log  # 循環 import を避けるため関数内で読む
+
+        df = read_log(source)
     trace = standardize(df, signal_map, resample_hz=resample_hz)
     events = detect_shift_events(trace, vehicle)
     rows = [event_kpis(trace, ev, vehicle) for ev in events]
@@ -765,10 +927,16 @@ def make_j1939_demo_log(
         input_rpm = np.where(in_gear, out_rpm * gearbox_ratio, np.nan)
         # ニュートラル中の入力軸はクラッチが切れて自由回転する: 前後を線形に繋ぐ
         input_series = pd.Series(input_rpm).interpolate(limit_direction="both")
-        slip_pct = np.clip(
+        # すべり率: 回転差ベースと、クラッチストロークから決まる「切れ具合」の
+        # 大きい方。実車の TCU もクラッチが離れていれば 100% を出す。
+        speed_slip = np.clip(
             np.abs(w_e - input_series.to_numpy()) / np.maximum(w_e, 1.0) * 100.0, 0.0, 100.0
         )
-        slip_pct = np.where(in_gear, slip_pct, 100.0)
+        kiss = trm.clutch_kiss_point
+        engagement = np.clip(
+            (tr["clutch_position"].to_numpy() - kiss) / (1.0 - kiss), 0.0, 1.0
+        )
+        slip_pct = np.maximum(speed_slip, (1.0 - engagement) * 100.0)
 
         demand = np.array(
             [eng.steady_torque(scenario.throttle, w / 9.5493) for w in w_e]

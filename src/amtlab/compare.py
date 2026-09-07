@@ -32,7 +32,23 @@ COMPARISON_KPIS = (
     "speed_drop_kmh",
     "speed_loss_kmh",
     "torque_interrupt_s",
+    "clutch_cycle_time_s",
+    "clutch_full_release_ratio",
     "jerk_rms",
+)
+
+#: 大きいほど良い KPI(クラッチをしっかり切れている、など)
+HIGHER_IS_BETTER = frozenset({"clutch_full_release_ratio"})
+
+#: 良し悪しを一意に決められない KPI(向きだけ report する)
+NEUTRAL_KPIS = frozenset(
+    {
+        "clutch_mean_slip_pct",
+        "clutch_peak_slip_pct",
+        "clutch_release_rate_pct_s",
+        "clutch_engage_rate_pct_s",
+        "clutch_slip_integral_pct_s",
+    }
 )
 
 #: 条件補正に使う説明変数(ログから取れるもの)
@@ -104,6 +120,18 @@ def check_comparability(
                 "ジャークの算出根拠がグループ間で違います "
                 f"({', '.join(f'{g}={chr(47).join(v)}' for g, v in per_group.items())})。"
                 "jerk_rms の比較は避けてください"
+            )
+
+    if "clutch_slip_source" in events.columns:
+        per_group = events.groupby(group_col)["clutch_slip_source"].agg(
+            lambda s: tuple(sorted(set(s.dropna())))
+        )
+        if len(set(per_group)) > 1:
+            detail = ", ".join(f"{g}={'/'.join(v)}" for g, v in per_group.items())
+            warnings.append(
+                f"クラッチすべり率の出所がグループ間で違います ({detail})。"
+                "SPN 522 の実測と回転差からの代用では、ニュートラル中の"
+                "切り深さの見え方が変わるため、クラッチ系 KPI は比較できません"
             )
 
     # 標本サイズ ----------------------------------------------------------
@@ -287,15 +315,17 @@ def adjusted_difference(
     return float(np.mean(model.predict(as_other) - model.predict(as_ref)))
 
 
-def _verdict(diff: float, ci_low: float, ci_high: float, delta: float) -> str:
-    """差の読み方を一言で。"""
+def _verdict(diff: float, ci_low: float, ci_high: float, delta: float, kpi: str) -> str:
+    """差の読み方を一言で。KPI ごとに「大きいほど良い」向きを考慮する。"""
     if not np.isfinite(ci_low) or not np.isfinite(ci_high):
         return "判定不能"
     if ci_low <= 0.0 <= ci_high:
         return "差は有意でない"
-    direction = "悪化" if diff > 0 else "改善"
     size = "大" if abs(delta) >= 0.474 else "中" if abs(delta) >= 0.33 else "小"
-    return f"{direction}(効果量: {size})"
+    if kpi in NEUTRAL_KPIS:
+        return f"{'増加' if diff > 0 else '減少'}(効果量: {size})"
+    worse = diff > 0 if kpi not in HIGHER_IS_BETTER else diff < 0
+    return f"{'悪化' if worse else '改善'}(効果量: {size})"
 
 
 def compare_groups(
@@ -368,7 +398,7 @@ def compare_groups(
                         if adjust
                         else np.nan
                     ),
-                    "verdict": _verdict(diff, ci_low, ci_high, delta),
+                    "verdict": _verdict(diff, ci_low, ci_high, delta, kpi),
                 }
             )
 

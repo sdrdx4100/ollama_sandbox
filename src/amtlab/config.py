@@ -60,6 +60,8 @@ class OllamaConfig:
 @dataclass
 class PipelineConfig:
     output_dir: str = "outputs"
+    #: 車両プリセット名 (passenger6 / truck12)
+    vehicle: str = "passenger6"
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
@@ -94,6 +96,12 @@ class PipelineConfig:
             return cls()
         data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
         return cls.from_dict(data)
+
+    def vehicle_params(self):
+        """車両プリセットを解決する。"""
+        from .simulation.vehicle import get_vehicle
+
+        return get_vehicle(self.vehicle)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

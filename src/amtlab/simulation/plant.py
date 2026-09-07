@@ -20,6 +20,7 @@ from .controller import (
     ShiftController,
     ShiftControlParams,
     ShiftPhase,
+    scaled_bounds,
 )
 from .vehicle import KMH_PER_MS, VehicleParams, rads_to_rpm
 
@@ -256,7 +257,7 @@ def simulate_shift(
     return ShiftResult(
         trace=trace,
         scenario=scenario,
-        control=control.clipped(),
+        control=control.clipped(scaled_bounds(veh)),
         shift_start_time=shift_start,
         shift_end_time=(
             float(shift_end) if not np.isnan(shift_end) else float(trace["time"].iloc[-1])

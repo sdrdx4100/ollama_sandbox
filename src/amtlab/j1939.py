@@ -480,6 +480,14 @@ def inspect_log(df: pd.DataFrame, mapping: dict[str, str] | None = None) -> LogR
             "微分すると駆動系のねじり振動(シャッフル)を測ることになるため、"
             "車体のジャークには使いません(振動の観察用に driveline_speed_kmh として保持)"
         )
+    keys = {ch.key for ch in report.channels}
+    if "clutch_slip_pct" not in keys and {"engine_speed_rpm", "input_shaft_rpm"} <= keys:
+        report.warnings.append(
+            "クラッチ滑り率(SPN 522)が無いため、エンジン回転と入力軸回転の差から"
+            "代用します。ただしニュートラル中は入力軸がクラッチから切り離されて"
+            "自由回転するため、**クラッチをどれだけ深く切ったかは測れません**"
+            "(clutch_full_release_ratio 等は過小評価になります)"
+        )
     if any(ch.key == "front_axle_speed_kmh" for ch in report.channels):
         report.warnings.append(
             "前輪が非駆動輪であれば SPN 904 は駆動系のねじりを含まないため、"
@@ -521,6 +529,15 @@ def decode(df: pd.DataFrame, mapping: dict[str, str] | None = None) -> pd.DataFr
 
     if "engine_speed_rpm" in out and "input_shaft_rpm" in out:
         out["clutch_slip_rpm"] = out["engine_speed_rpm"] - out["input_shaft_rpm"]
+        if "clutch_slip_pct" not in out:
+            # SPN 522 が無くても、エンジン回転と入力軸回転から同義の量を作れる
+            reference = out["engine_speed_rpm"].abs().clip(lower=1.0)
+            out["clutch_slip_pct"] = (
+                (out["clutch_slip_rpm"].abs() / reference * 100.0).clip(0.0, 100.0)
+            )
+            out.attrs["clutch_slip_source"] = (
+                "derived (engine_speed - input_shaft_speed)"
+            )
 
     if "accel_pedal_pct" in out:
         out["throttle"] = (out["accel_pedal_pct"] / 100.0).clip(0.0, 1.0)

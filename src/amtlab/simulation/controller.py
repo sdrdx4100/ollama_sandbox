@@ -28,7 +28,10 @@ class ShiftPhase(str, Enum):
     DONE = "done"
 
 
-#: 適合パラメータの探索範囲 (Optuna / ランダム実験計画で共用)
+#: 適合パラメータの探索範囲 (Optuna / ランダム実験計画で共用)。
+#: **乗用車(最大トルク 190 Nm / 最高 6800 rpm)基準**の値。
+#: トラックのようにトルク・回転域が違う車両では :func:`scaled_bounds` で
+#: スケールしたものを使う。
 CONTROL_BOUNDS: dict[str, tuple[float, float]] = {
     "torque_reduce_rate": (200.0, 4000.0),
     "clutch_open_rate": (2.0, 25.0),
@@ -39,6 +42,43 @@ CONTROL_BOUNDS: dict[str, tuple[float, float]] = {
     "torque_recovery_slip": (2.0, 45.0),
     "torque_recovery_rate": (150.0, 4000.0),
 }
+
+
+#: エンジントルクに比例してスケールする適合値 [Nm/s], [Nm/(rad/s)]
+TORQUE_SCALED_PARAMS = ("torque_reduce_rate", "torque_recovery_rate", "sync_gain")
+#: 回転域に比例してスケールする適合値 [rad/s]
+SPEED_SCALED_PARAMS = ("sync_slip_offset", "torque_recovery_slip")
+
+#: CONTROL_BOUNDS が基準にしている乗用車の代表値
+REFERENCE_TORQUE_NM = 190.0
+REFERENCE_MAX_RPM = 6800.0
+
+
+def vehicle_scales(vehicle) -> tuple[float, float]:
+    """車両のトルク倍率・回転域倍率を返す(乗用車基準)。"""
+    torque_scale = max(vehicle.engine.wot_torque) / REFERENCE_TORQUE_NM
+    speed_scale = vehicle.engine.max_rpm / REFERENCE_MAX_RPM
+    return float(torque_scale), float(speed_scale)
+
+
+def scaled_bounds(vehicle) -> dict[str, tuple[float, float]]:
+    """車両に合わせて適合値の探索範囲をスケールする。
+
+    トラックはエンジントルクが 1 桁大きいので、乗用車基準のトルク勾配
+    (Nm/s)では変速が成立しない。逆に回転域は狭いので、すべりオフセットの
+    ような回転量は小さくする。
+    """
+
+    torque_scale, speed_scale = vehicle_scales(vehicle)
+    out: dict[str, tuple[float, float]] = {}
+    for name, (lo, hi) in CONTROL_BOUNDS.items():
+        if name in TORQUE_SCALED_PARAMS:
+            out[name] = (lo * torque_scale, hi * torque_scale)
+        elif name in SPEED_SCALED_PARAMS:
+            out[name] = (lo * speed_scale, hi * speed_scale)
+        else:
+            out[name] = (lo, hi)
+    return out
 
 
 @dataclass
@@ -57,12 +97,29 @@ class ShiftControlParams:
     def as_dict(self) -> dict[str, float]:
         return asdict(self)
 
-    def clipped(self) -> "ShiftControlParams":
+    def clipped(self, bounds: dict[str, tuple[float, float]] | None = None
+                ) -> "ShiftControlParams":
         """探索範囲内にクリップした新しいインスタンスを返す。"""
+        bounds = bounds or CONTROL_BOUNDS
         values = {}
         for f in fields(self):
-            lo, hi = CONTROL_BOUNDS[f.name]
+            lo, hi = bounds[f.name]
             values[f.name] = float(np.clip(getattr(self, f.name), lo, hi))
+        return ShiftControlParams(**values)
+
+    @staticmethod
+    def default_for(vehicle) -> "ShiftControlParams":
+        """車両に合わせて既定の適合値をスケールする(ベースライン用)。"""
+        torque_scale, speed_scale = vehicle_scales(vehicle)
+        base = ShiftControlParams()
+        values = {}
+        for f in fields(base):
+            value = getattr(base, f.name)
+            if f.name in TORQUE_SCALED_PARAMS:
+                value *= torque_scale
+            elif f.name in SPEED_SCALED_PARAMS:
+                value *= speed_scale
+            values[f.name] = float(value)
         return ShiftControlParams(**values)
 
     @staticmethod
@@ -71,10 +128,14 @@ class ShiftControlParams:
         return ShiftControlParams(**{k: float(v) for k, v in d.items() if k in known})
 
     @staticmethod
-    def sample(rng: np.random.Generator) -> "ShiftControlParams":
+    def sample(
+        rng: np.random.Generator,
+        bounds: dict[str, tuple[float, float]] | None = None,
+    ) -> "ShiftControlParams":
         """探索範囲から一様乱数でサンプリング(実験計画用)。"""
+        bounds = bounds or CONTROL_BOUNDS
         return ShiftControlParams(
-            **{k: float(rng.uniform(lo, hi)) for k, (lo, hi) in CONTROL_BOUNDS.items()}
+            **{k: float(rng.uniform(lo, hi)) for k, (lo, hi) in bounds.items()}
         )
 
 
@@ -116,7 +177,7 @@ class ShiftController:
 
     def __init__(self, vehicle, params: ShiftControlParams, from_gear: int, to_gear: int):
         self.vehicle = vehicle
-        self.params = params.clipped()
+        self.params = params.clipped(scaled_bounds(vehicle))
         self.from_gear = from_gear
         self.to_gear = to_gear
         self.phase = ShiftPhase.IN_GEAR

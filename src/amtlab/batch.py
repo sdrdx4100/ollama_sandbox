@@ -21,7 +21,13 @@ import pandas as pd
 from joblib import Parallel, delayed
 
 from . import j1939
-from .ingest import SignalMap, detect_shift_events, event_kpis, standardize
+from .ingest import (
+    SignalMap,
+    clutch_profile,
+    detect_shift_events,
+    event_kpis,
+    standardize,
+)
 from .simulation.vehicle import VehicleParams
 
 #: 対応するログ拡張子
@@ -170,6 +176,8 @@ class BatchResult:
 
     events: pd.DataFrame = field(default_factory=pd.DataFrame)
     files: pd.DataFrame = field(default_factory=pd.DataFrame)
+    #: クラッチすべり率の波形(変速開始を 0 秒に揃えた短い区間だけ)
+    profiles: pd.DataFrame = field(default_factory=pd.DataFrame)
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -211,7 +219,8 @@ def _analyze_one(
     resample_hz: float | None,
     settle_time: float,
     group: str = "",
-) -> tuple[FileReport, pd.DataFrame]:
+    profiles: bool = False,
+) -> tuple[FileReport, pd.DataFrame, pd.DataFrame]:
     report = FileReport(path=str(path), group=group)
     try:
         df, mapping = load_log(path, signal_map)
@@ -231,10 +240,20 @@ def _analyze_one(
                 kpi.insert(0, "group", group)
             report.detection_source = str(kpi["detection_source"].iloc[0])
         report.n_events = len(kpi)
-        return report, kpi
+
+        profile = pd.DataFrame()
+        if profiles and events:
+            frames = [clutch_profile(trace, ev) for ev in events]
+            frames = [f for f in frames if len(f)]
+            if frames:
+                profile = pd.concat(frames, ignore_index=True)
+                profile.insert(0, "source_file", path.name)
+                if group:
+                    profile.insert(0, "group", group)
+        return report, kpi, profile
     except Exception as exc:  # ファイル 1 つの失敗で全体を止めない
         report.error = f"{type(exc).__name__}: {exc}"
-        return report, pd.DataFrame()
+        return report, pd.DataFrame(), pd.DataFrame()
 
 
 def analyze_logs(
@@ -244,6 +263,7 @@ def analyze_logs(
     resample_hz: float | None = 100.0,
     settle_time: float = 0.6,
     n_jobs: int = -1,
+    profiles: bool = False,
 ) -> BatchResult:
     """複数ログをまとめて解析し、変速イベント KPI 表に畳む。
 
@@ -253,6 +273,10 @@ def analyze_logs(
     ``patterns`` に ``{"A社": "logs/a/", "B社": "logs/b/"}`` のような dict を
     渡すと、イベント表に ``group`` 列が付き :mod:`amtlab.compare` で
     グループ比較できる。
+
+    ``profiles=True`` にすると、クラッチすべり率の波形を変速開始 0 秒に
+    揃えた短い区間だけ残す(1 イベント 160 点)。切り方の形をファイル横断で
+    重ね描きするのに使う。
     """
 
     pairs = iter_log_groups(patterns)
@@ -260,11 +284,14 @@ def analyze_logs(
         return BatchResult(warnings=[f"ログが見つかりません: {patterns}"])
 
     results = Parallel(n_jobs=n_jobs, prefer="processes")(
-        delayed(_analyze_one)(p, signal_map, vehicle, resample_hz, settle_time, g)
+        delayed(_analyze_one)(
+            p, signal_map, vehicle, resample_hz, settle_time, g, profiles
+        )
         for g, p in pairs
     )
-    reports = [r for r, _ in results]
-    frames = [k for _, k in results if len(k)]
+    reports = [r for r, _, _ in results]
+    frames = [k for _, k, _ in results if len(k)]
+    profile_frames = [pr for _, _, pr in results if len(pr)]
 
     events = (
         pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -274,7 +301,14 @@ def analyze_logs(
     files = pd.DataFrame([r.__dict__ for r in reports])
     files["detected"] = files["detected"].apply(lambda t: ",".join(t))
 
-    result = BatchResult(events=events, files=files)
+    result = BatchResult(
+        events=events,
+        files=files,
+        profiles=(
+            pd.concat(profile_frames, ignore_index=True)
+            if profile_frames else pd.DataFrame()
+        ),
+    )
     result.warnings = _batch_warnings(reports, events)
     if "group" in events.columns:
         per_group = events.groupby("group")["source_file"].nunique()

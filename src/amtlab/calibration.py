@@ -20,24 +20,61 @@ from joblib import Parallel, delayed
 
 from .features import ObjectiveSpec, extract_kpis, scalar_objective
 from .modeling import SurrogateModel
-from .simulation.controller import CONTROL_BOUNDS, ShiftControlParams
+from .simulation.controller import CONTROL_BOUNDS, ShiftControlParams, scaled_bounds
 from .simulation.plant import ShiftScenario, SimSettings, simulate_shift
 from .simulation.vehicle import VehicleParams
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
-def default_scenarios() -> list[ShiftScenario]:
-    """適合の代表条件(発進直後の低速段〜高速段、上り勾配、ダウンシフト)。"""
-    return [
-        ShiftScenario(1, 2, speed_kmh=18.0, throttle=0.85),
-        ShiftScenario(2, 3, speed_kmh=42.0, throttle=0.60),
-        ShiftScenario(3, 4, speed_kmh=70.0, throttle=0.45),
-        ShiftScenario(4, 5, speed_kmh=95.0, throttle=0.35),
-        ShiftScenario(2, 3, speed_kmh=38.0, throttle=0.75, grade_pct=6.0, payload_kg=300.0),
-        ShiftScenario(4, 3, speed_kmh=55.0, throttle=0.40),
-        ShiftScenario(5, 4, speed_kmh=80.0, throttle=0.30),
+def default_scenarios(vehicle: VehicleParams | None = None) -> list[ShiftScenario]:
+    """適合の代表条件(低速段〜高速段、上り勾配、ダウンシフト)。
+
+    車両を渡すと段数と実用回転域に合わせて条件を作り直す。12 速トラックなら
+    低速段・中速段・高速段とダウンシフトを段数に応じて配る。
+    """
+
+    if vehicle is None:
+        return [
+            ShiftScenario(1, 2, speed_kmh=18.0, throttle=0.85),
+            ShiftScenario(2, 3, speed_kmh=42.0, throttle=0.60),
+            ShiftScenario(3, 4, speed_kmh=70.0, throttle=0.45),
+            ShiftScenario(4, 5, speed_kmh=95.0, throttle=0.35),
+            ShiftScenario(2, 3, speed_kmh=38.0, throttle=0.75, grade_pct=6.0,
+                          payload_kg=300.0),
+            ShiftScenario(4, 3, speed_kmh=55.0, throttle=0.40),
+            ShiftScenario(5, 4, speed_kmh=80.0, throttle=0.30),
+        ]
+
+    from .dataset import ScenarioSpace
+
+    space = ScenarioSpace.for_vehicle(vehicle)
+    n = vehicle.transmission.n_gears()
+    payload = vehicle.mass * 1.5 if vehicle.mass > 5000 else 300.0
+
+    def speed_at(gear: int, rpm: float) -> float:
+        w = rpm / 9.5493
+        return float(w * vehicle.wheel_radius / vehicle.transmission.total_ratio(gear) * 3.6)
+
+    up_rpm = float(np.mean(space.upshift_rpm))
+    down_rpm = float(np.mean(space.downshift_rpm))
+    # 低速段・中速段・高速段を段数に応じて選ぶ
+    gears = sorted({max(1, n // 4), n // 2, max(1, n - 4), n - 1})
+    scenarios = [
+        ShiftScenario(g, g + 1, speed_kmh=speed_at(g, up_rpm),
+                      throttle=0.85 - 0.12 * i)
+        for i, g in enumerate(gears)
     ]
+    mid = max(1, n // 2)
+    scenarios.append(
+        ShiftScenario(mid, mid + 1, speed_kmh=speed_at(mid, up_rpm * 1.05),
+                      throttle=0.9, grade_pct=6.0, payload_kg=payload)
+    )
+    for g in (max(2, n // 2), max(2, n - 2)):
+        scenarios.append(
+            ShiftScenario(g, g - 1, speed_kmh=speed_at(g, down_rpm), throttle=0.35)
+        )
+    return scenarios
 
 
 #: 目的関数には入れないが、必ず併記して監視する KPI
@@ -94,10 +131,13 @@ def aggregate(df: pd.DataFrame, setting: CalibrationSetting) -> dict[str, float]
     return agg
 
 
-def suggest_control(trial: optuna.Trial) -> ShiftControlParams:
+def suggest_control(
+    trial: optuna.Trial, bounds: dict[str, tuple[float, float]] | None = None
+) -> ShiftControlParams:
     """探索空間から適合値をサンプリングする。"""
+    bounds = bounds or CONTROL_BOUNDS
     return ShiftControlParams(
-        **{name: trial.suggest_float(name, lo, hi) for name, (lo, hi) in CONTROL_BOUNDS.items()}
+        **{name: trial.suggest_float(name, lo, hi) for name, (lo, hi) in bounds.items()}
     )
 
 
@@ -174,7 +214,8 @@ def calibrate(
     """
 
     setting = setting or CalibrationSetting()
-    baseline = baseline or ShiftControlParams()
+    baseline = baseline or ShiftControlParams.default_for(setting.vehicle)
+    bounds = scaled_bounds(setting.vehicle)
 
     def metrics_for(control: ShiftControlParams) -> dict[str, float]:
         if surrogates:
@@ -183,7 +224,7 @@ def calibrate(
 
     if mode == "scalar":
         def objective(trial: optuna.Trial) -> float:
-            control = suggest_control(trial)
+            control = suggest_control(trial, bounds)
             m = metrics_for(control)
             for k, v in m.items():
                 trial.set_user_attr(k, float(v))
@@ -201,7 +242,7 @@ def calibrate(
         )
     else:
         def objective(trial: optuna.Trial) -> tuple[float, ...]:
-            control = suggest_control(trial)
+            control = suggest_control(trial, bounds)
             m = metrics_for(control)
             for k, v in m.items():
                 trial.set_user_attr(k, float(v))

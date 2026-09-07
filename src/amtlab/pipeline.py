@@ -81,6 +81,9 @@ def run_pipeline(
     log = (lambda msg: print(f"[amtlab] {msg}", flush=True)) if verbose else (lambda msg: None)
 
     cfg.dump(out["root"] / "config.used.yaml")
+    vehicle = cfg.vehicle_params()
+    log(f"車両: {cfg.vehicle} ({vehicle.transmission.n_gears()} 速 / "
+        f"{vehicle.total_mass:.0f} kg)")
 
     # 1) DoE データセット ------------------------------------------------
     if dataset is None:
@@ -89,6 +92,7 @@ def run_pipeline(
             n_samples=cfg.dataset.n_samples,
             seed=cfg.dataset.seed,
             n_jobs=cfg.dataset.n_jobs,
+            vehicle=vehicle,
         )
     dataset.to_csv(out["data"] / "dataset.csv", index=False)
     log(f"    -> {len(dataset)} events / 完了率 {dataset['completed'].mean():.1%}")
@@ -143,6 +147,8 @@ def run_pipeline(
     # 4) 適合値の最適化 --------------------------------------------------
     log(f"4/6 適合最適化 ({cfg.calibration.mode}, {cfg.calibration.n_trials} trials) ...")
     setting = CalibrationSetting(
+        scenarios=default_scenarios(vehicle),
+        vehicle=vehicle,
         objectives=cfg.calibration.objective_spec(),
         worst_case_weight=cfg.calibration.worst_case_weight,
     )
@@ -193,9 +199,10 @@ def run_pipeline(
             viz.plot_pareto(outcome.pareto, out["figures"], keys=setting.objectives.keys)
         )
 
-    demo_scenario = default_scenarios()[1]
+    demo_scenario = setting.scenarios[1]
     traces = {
-        label: simulate_shift(control, demo_scenario, settings=setting.sim)
+        label: simulate_shift(control, demo_scenario, vehicle=vehicle,
+                              settings=setting.sim)
         for label, control in (
             ("baseline", outcome.baseline_control),
             ("optimized", outcome.best_control),

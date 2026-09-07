@@ -13,7 +13,7 @@ import pandas as pd
 from joblib import Parallel, delayed
 
 from .features import result_to_row
-from .simulation.controller import ShiftControlParams
+from .simulation.controller import ShiftControlParams, scaled_bounds
 from .simulation.plant import ShiftScenario, SimSettings, simulate_shift
 from .simulation.vehicle import KMH_PER_MS, VehicleParams, rpm_to_rads
 
@@ -31,6 +31,30 @@ class ScenarioSpace:
     max_engine_rpm: float = 6200.0
     min_engine_rpm: float = 900.0
     vehicle: VehicleParams = field(default_factory=VehicleParams)
+
+    @staticmethod
+    def for_vehicle(vehicle: VehicleParams) -> "ScenarioSpace":
+        """車両のトルク特性から変速回転域を決める。
+
+        ディーゼルのトラックは常用回転域が狭く(例: 1000〜1900 rpm)、
+        乗用ガソリンは広い。アイドルと定格回転(全開トルクがピークの 75% を
+        保てる最高回転)から実用的な帯を作る。
+        """
+
+        engine = vehicle.engine
+        peak = max(engine.wot_torque)
+        rated_rpm = max(
+            rpm for rpm, torque in zip(engine.wot_rpm, engine.wot_torque)
+            if torque >= 0.75 * peak
+        )
+        idle = engine.idle_rpm
+        return ScenarioSpace(
+            upshift_rpm=(idle * 2.2, rated_rpm * 1.05),
+            downshift_rpm=(idle * 1.6, rated_rpm * 0.75),
+            min_engine_rpm=idle * 1.2,
+            max_engine_rpm=engine.max_rpm * 0.98,
+            vehicle=vehicle,
+        )
 
     def sample(self, rng: np.random.Generator) -> ShiftScenario:
         trm = self.vehicle.transmission
@@ -104,9 +128,11 @@ def build_dataset(
     """
 
     rng = np.random.default_rng(seed)
-    space = space or ScenarioSpace(vehicle=vehicle or VehicleParams())
+    vehicle = vehicle or VehicleParams()
+    space = space or ScenarioSpace.for_vehicle(vehicle)
+    bounds = scaled_bounds(vehicle)
     scenarios = [space.sample(rng) for _ in range(n_samples)]
-    controls = [ShiftControlParams.sample(rng) for _ in range(n_samples)]
+    controls = [ShiftControlParams.sample(rng, bounds) for _ in range(n_samples)]
     df = run_batch(controls, scenarios, vehicle=vehicle, settings=settings, n_jobs=n_jobs)
     df.insert(0, "event_id", np.arange(len(df)))
     return df
