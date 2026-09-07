@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .features import speed_drop_metrics
 from .simulation.plant import SimSettings, _lowpass, simulate_shift
 from .simulation.vehicle import KMH_PER_MS, VehicleParams
 
@@ -205,8 +206,13 @@ def event_kpis(trace: pd.DataFrame, event: ShiftEvent,
     )
     flare = win["engine_speed_rpm"].to_numpy() - np.maximum(w_in_rpm, start_rpm)
 
+    speed = speed_drop_metrics(
+        win["time"].to_numpy(), win["speed_kmh"].to_numpy(), pre_accel
+    )
+
     kpis = {
         "event_id": float(event.index),
+        "current_gear": float(event.from_gear),
         "from_gear": float(event.from_gear),
         "to_gear": float(event.to_gear),
         "is_upshift": float(event.is_upshift),
@@ -219,7 +225,7 @@ def event_kpis(trace: pd.DataFrame, event: ShiftEvent,
         "jerk_peak": float(np.max(np.abs(jerk))),
         "accel_drop": float(pre_accel - np.min(accel)),
         "min_accel": float(np.min(accel)),
-        "speed_loss_kmh": max(float(pre_speed - np.min(win["speed_kmh"].to_numpy())), 0.0),
+        **speed,
         "engine_flare_rpm": float(max(np.max(flare), 0.0)),
         "neutral_time_s": float((win["gear"].to_numpy() <= 0).sum() * dt),
         "completed": 1.0,

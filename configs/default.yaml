@@ -7,8 +7,9 @@ dataset:
   n_jobs: -1
 
 model:
-  targets: [jerk_rms, shift_time_s, clutch_energy_j]
-  primary_target: jerk_rms
+  # 代理モデルを作る KPI。primary_target は感度解析(重要度/PDP)の対象
+  targets: [shift_time_s, speed_drop_kmh, speed_loss_kmh, jerk_rms]
+  primary_target: shift_time_s
   n_trials: 40        # Optuna によるハイパーパラメータ探索回数
   n_splits: 5
   model_names: [hist_gbr, random_forest, extra_trees, ridge]
@@ -20,10 +21,17 @@ calibration:
   seed: 0
   use_surrogate: false  # true にすると代理モデルで高速探索
   worst_case_weight: 0.3
+  # 目的 KPI(多目的モードでは並び順が軸の順序)。
+  #   shift_time_s   : 変速時間
+  #   speed_loss_kmh : 変速による車速損失(変速しなかった場合との差)
+  #   jerk_rms       : 変速ショック(速さを追い過ぎないための抑え役)
+  # 実測の落ち込み幅 speed_drop_kmh は記述指標として全ての表・図に併記される
+  # (全開アップシフトで恒等的に 0 になり目的関数に向かないため)。
+  objectives: [shift_time_s, speed_loss_kmh, jerk_rms]
   weights:
-    jerk_rms: 0.5
-    shift_time_s: 0.35
-    clutch_energy_j: 0.15
+    shift_time_s: 0.40
+    speed_loss_kmh: 0.40
+    jerk_rms: 0.20
 
 ollama:
   enabled: true

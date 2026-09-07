@@ -8,7 +8,7 @@ from typing import Any
 
 import yaml
 
-from .features import DEFAULT_WEIGHTS
+from .features import ObjectiveSpec
 
 
 @dataclass
@@ -21,9 +21,9 @@ class DatasetConfig:
 @dataclass
 class ModelConfig:
     targets: list[str] = field(
-        default_factory=lambda: ["jerk_rms", "shift_time_s", "clutch_energy_j"]
+        default_factory=lambda: ["shift_time_s", "speed_drop_kmh", "speed_loss_kmh", "jerk_rms"]
     )
-    primary_target: str = "jerk_rms"
+    primary_target: str = "shift_time_s"
     n_trials: int = 40
     n_splits: int = 5
     model_names: list[str] = field(
@@ -39,7 +39,12 @@ class CalibrationConfig:
     seed: int = 0
     use_surrogate: bool = False
     worst_case_weight: float = 0.3
-    weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
+    #: 目的 KPI(順序は多目的最適化の軸順)と重み
+    objectives: list[str] = field(default_factory=lambda: list(ObjectiveSpec().keys))
+    weights: dict[str, float] = field(default_factory=lambda: dict(ObjectiveSpec().weights))
+
+    def objective_spec(self) -> ObjectiveSpec:
+        return ObjectiveSpec.from_config(keys=self.objectives, weights=self.weights)
 
 
 @dataclass

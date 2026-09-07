@@ -31,7 +31,7 @@ def summary():
 
 def test_fallback_report_contains_all_sections(summary):
     text = fallback_report(summary)
-    for heading in ("# AMT 変速品質 解析レポート", "## 1. サマリ", "## 2.", "## 3.", "## 4."):
+    for heading in ("# AMT 変速品質 解析レポート", "## 1. サマリ", "## 2.", "## 4.", "## 5."):
         assert heading in text
     assert "clutch_close_rate" in text
     assert "39.5" in text

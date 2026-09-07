@@ -26,7 +26,7 @@ from .calibration import (
 )
 from .config import PipelineConfig
 from .dataset import build_dataset
-from .features import OBJECTIVE_KPIS
+from .features import gear_summary
 from .modeling import (
     SurrogateModel,
     condition_only_baseline,
@@ -93,6 +93,13 @@ def run_pipeline(
     dataset.to_csv(out["data"] / "dataset.csv", index=False)
     log(f"    -> {len(dataset)} events / 完了率 {dataset['completed'].mean():.1%}")
 
+    gears = gear_summary(dataset)
+    gears.to_csv(out["tables"] / "gear_summary.csv", index=False)
+    worst = gears.sort_values("speed_loss_kmh_mean", ascending=False).iloc[0]
+    log(f"    -> カレントギア別で車速損失が最大なのは {int(worst['current_gear'])} 速 "
+        f"{worst['direction']} (平均 {worst['speed_loss_kmh_mean']:.2f} km/h / "
+        f"変速時間 {worst['shift_time_s_mean']:.2f} s)")
+
     # 2) 代理モデル(Optuna でハイパーパラメータ探索) ---------------------
     log(f"2/6 代理モデル学習 + Optuna 探索 ({cfg.model.n_trials} trials) ...")
     tuning = tune_surrogate(
@@ -136,7 +143,7 @@ def run_pipeline(
     # 4) 適合値の最適化 --------------------------------------------------
     log(f"4/6 適合最適化 ({cfg.calibration.mode}, {cfg.calibration.n_trials} trials) ...")
     setting = CalibrationSetting(
-        weights=cfg.calibration.weights,
+        objectives=cfg.calibration.objective_spec(),
         worst_case_weight=cfg.calibration.worst_case_weight,
     )
     outcome = calibrate(
@@ -170,6 +177,8 @@ def run_pipeline(
     log("5/6 seaborn による可視化 ...")
     figs = [
         viz.plot_kpi_distributions(dataset, out["figures"]),
+        viz.plot_gear_analysis(dataset, out["figures"]),
+        viz.plot_speed_time_relation(dataset, out["figures"]),
         viz.plot_kpi_correlation(dataset, out["figures"]),
         viz.plot_condition_map(dataset, out["figures"], kpi=cfg.model.primary_target),
         viz.plot_model_diagnostics(surrogates[cfg.model.primary_target], out["figures"]),
@@ -180,7 +189,9 @@ def run_pipeline(
     if "objective" in outcome.trials.columns:
         figs.append(viz.plot_optuna_history(outcome.trials, out["figures"]))
     if len(outcome.pareto):
-        figs.append(viz.plot_pareto(outcome.pareto, out["figures"]))
+        figs.append(
+            viz.plot_pareto(outcome.pareto, out["figures"], keys=setting.objectives.keys)
+        )
 
     demo_scenario = default_scenarios()[1]
     traces = {
@@ -198,7 +209,7 @@ def run_pipeline(
     # 6) レポート --------------------------------------------------------
     log("6/6 レポート生成 ...")
     summary = build_summary(
-        dataset, surrogates, importance, outcome,
+        dataset, surrogates, importance, outcome, gears=gears,
         tuning={
             "best_model": tuning.best_model_name,
             "best_rmse": round(tuning.best_rmse, 4),
@@ -206,7 +217,10 @@ def run_pipeline(
             "condition_only_r2": round(cond_only["r2"], 4),
         },
     )
-    summary["objectives"] = list(OBJECTIVE_KPIS)
+    summary["objectives"] = {
+        "keys": list(setting.objectives.keys),
+        "weights": dict(setting.objectives.weights),
+    }
     (out["root"] / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )

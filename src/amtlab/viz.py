@@ -81,7 +81,7 @@ def plot_shift_trace(result: ShiftResult, outdir: Path | str, name: str = "shift
     """1 変速イベントの時系列(回転・トルク・クラッチ・加速度/ジャーク)。"""
     set_style()
     tr = result.trace
-    fig, axes = plt.subplots(4, 1, figsize=(10, 11), sharex=True)
+    fig, axes = plt.subplots(5, 1, figsize=(10, 13), sharex=True)
 
     ax = axes[0]
     _shade_phases(ax, tr)
@@ -110,7 +110,38 @@ def plot_shift_trace(result: ShiftResult, outdir: Path | str, name: str = "shift
     ax2.grid(False)
     ax.set_ylabel("clutch stroke [-]")
 
+    # --- 車速: 落ち込み幅(ピーク->谷)と「変速しなかった場合」との差 ---------
     ax = axes[3]
+    _shade_phases(ax, tr)
+    sns.lineplot(data=tr, x="time", y="speed_kmh", ax=ax, lw=1.8, color="tab:green",
+                 label="vehicle speed")
+    win = tr[(tr["time"] >= result.shift_start_time)]
+    pre = tr[tr["time"] < result.shift_start_time]
+    if len(win) > 2:
+        v = win["speed_kmh"].to_numpy()
+        t = win["time"].to_numpy()
+        i_min = int(np.argmin(v))
+        i_peak = int(np.argmax(v[: i_min + 1])) if i_min > 0 else 0
+        drop = float(v[i_peak] - v[i_min])
+        pre_accel = float(pre["accel"].mean()) if len(pre) else 0.0
+        ax.plot(t, v[0] + pre_accel * 3.6 * (t - t[0]), "--", color="0.45", lw=1.2,
+                label="no-shift reference")
+        loss = float(np.max(v[0] + pre_accel * 3.6 * (t - t[0]) - v))
+        if drop > 1e-3:
+            ax.annotate(
+                "", xy=(t[i_min], v[i_min]), xytext=(t[i_min], v[i_peak]),
+                arrowprops={"arrowstyle": "<->", "color": "crimson", "lw": 1.4},
+            )
+            ax.scatter([t[i_peak], t[i_min]], [v[i_peak], v[i_min]], color="crimson",
+                       s=22, zorder=5)
+        ax.set_title(
+            f"speed drop {drop:.2f} km/h (peak->trough) / shift loss {loss:.2f} km/h "
+            "(vs no-shift)", fontsize=9, loc="left",
+        )
+    ax.set_ylabel("speed [km/h]")
+    ax.legend(fontsize=8, loc="lower right")
+
+    ax = axes[4]
     _shade_phases(ax, tr)
     sns.lineplot(data=tr, x="time", y="accel_filt", ax=ax, label="accel [m/s2]", lw=1.6)
     ax2 = ax.twinx()
@@ -160,8 +191,8 @@ def plot_kpi_distributions(df: pd.DataFrame, outdir: Path | str,
                            name: str = "kpi_distributions") -> Path:
     """DoE データセットの KPI 分布(アップ/ダウンシフト別)。"""
     set_style()
-    kpis = [c for c in ("shift_time_s", "jerk_rms", "jerk_peak", "clutch_energy_j",
-                        "torque_interrupt_s", "engine_flare_rpm") if c in df.columns]
+    kpis = [c for c in ("shift_time_s", "speed_drop_kmh", "speed_loss_kmh",
+                        "torque_interrupt_s", "jerk_rms", "jerk_peak") if c in df.columns]
     long = df.melt(id_vars=["is_upshift"], value_vars=kpis,
                    var_name="kpi", value_name="value")
     long["direction"] = np.where(long["is_upshift"] == 1, "upshift", "downshift")
@@ -182,9 +213,9 @@ def plot_kpi_correlation(df: pd.DataFrame, outdir: Path | str,
     set_style()
     from .dataset import FEATURE_COLUMNS
 
-    kpis = [c for c in ("shift_time_s", "jerk_rms", "jerk_peak", "clutch_energy_j",
-                        "torque_interrupt_s", "engine_flare_rpm", "quality_score")
-            if c in df.columns]
+    kpis = [c for c in ("shift_time_s", "speed_drop_kmh", "speed_loss_kmh",
+                        "torque_interrupt_s", "jerk_rms", "jerk_peak",
+                        "clutch_energy_j", "quality_score") if c in df.columns]
     cols = [c for c in FEATURE_COLUMNS if c in df.columns]
     corr = df[cols + kpis].corr(method="spearman").loc[cols, kpis]
     fig, ax = plt.subplots(figsize=(9, 7))
@@ -281,20 +312,26 @@ def plot_optuna_history(trials: pd.DataFrame, outdir: Path | str,
     return _save(fig, outdir, name)
 
 
-def plot_pareto(pareto: pd.DataFrame, outdir: Path | str, name: str = "pareto_front") -> Path:
-    """多目的最適化のパレートフロント。"""
+def plot_pareto(pareto: pd.DataFrame, outdir: Path | str, name: str = "pareto_front",
+                keys: tuple[str, ...] | None = None) -> Path:
+    """多目的最適化のパレートフロント(第 3 目的は色で表現)。"""
     set_style()
-    x, y, z = OBJECTIVE_KPIS
+    keys = tuple(keys or OBJECTIVE_KPIS)
+    x, y = keys[0], keys[1]
+    z = keys[2] if len(keys) > 2 else None
     fig, ax = plt.subplots(figsize=(7.5, 5.5))
-    sc = ax.scatter(pareto[x], pareto[y], c=pareto[z], cmap="viridis", s=70,
-                    edgecolor="k", lw=0.4)
+    if z:
+        sc = ax.scatter(pareto[x], pareto[y], c=pareto[z], cmap="viridis", s=70,
+                        edgecolor="k", lw=0.4)
+        fig.colorbar(sc, ax=ax, label=f"{z}")
+    else:
+        ax.scatter(pareto[x], pareto[y], s=70, edgecolor="k", lw=0.4)
     best = pareto.sort_values("score").iloc[0]
     ax.scatter([best[x]], [best[y]], marker="*", s=380, color="crimson",
                edgecolor="k", zorder=5, label="selected (weighted best)")
-    fig.colorbar(sc, ax=ax, label=f"{z}")
     ax.set_xlabel(f"{x} (lower better)")
     ax.set_ylabel(f"{y} (lower better)")
-    ax.set_title("Pareto front: comfort vs shift time vs clutch energy")
+    ax.set_title("Pareto front: " + " vs ".join(keys))
     ax.legend()
     return _save(fig, outdir, name)
 
@@ -351,3 +388,51 @@ def plot_log_overview(trace: pd.DataFrame, events: pd.DataFrame, outdir: Path | 
     axes[2].set_xlabel("time [s]")
     fig.tight_layout()
     return _save(fig, outdir, name)
+
+
+def plot_gear_analysis(df: pd.DataFrame, outdir: Path | str,
+                       name: str = "gear_analysis") -> Path:
+    """カレントギア(現在ギア)別の KPI 分布。"""
+    set_style()
+    from .features import gear_long_format
+
+    long = gear_long_format(df)
+    g = sns.catplot(
+        data=long, x="current_gear", y="value", hue="direction", col="kpi",
+        kind="box", col_wrap=3, height=2.9, aspect=1.25, sharey=False,
+        showfliers=False, width=0.7,
+    )
+    g.set_titles("{col_name}")
+    g.set_axis_labels("current gear (= from_gear)", "")
+    g.figure.suptitle("Shift quality by current gear", y=1.03)
+    return _save(g.figure, outdir, name)
+
+
+def plot_speed_time_relation(df: pd.DataFrame, outdir: Path | str,
+                             name: str = "speed_time_relation") -> Path:
+    """変速時間と車速の落ち込みの関係(カレントギア別)。"""
+    set_style()
+    d = df.copy()
+    d["current gear"] = d["from_gear"].astype(int)
+    d["direction"] = np.where(d["is_upshift"] == 1, "upshift", "downshift")
+    metrics = [c for c in ("speed_drop_kmh", "speed_loss_kmh") if c in d.columns]
+    long = d.melt(
+        id_vars=["shift_time_s", "current gear", "direction", "throttle"],
+        value_vars=metrics, var_name="metric", value_name="value",
+    )
+    g = sns.relplot(
+        data=long, x="shift_time_s", y="value", hue="current gear", style="direction",
+        col="metric", kind="scatter", palette="viridis", height=3.6, aspect=1.2,
+        facet_kws={"sharey": False}, alpha=0.85, s=45,
+    )
+    for ax, metric in zip(g.axes.flat, metrics):
+        sub = d[["shift_time_s", metric]].dropna()
+        if len(sub) > 2:
+            coef = np.polyfit(sub["shift_time_s"], sub[metric], 1)
+            xs = np.linspace(sub["shift_time_s"].min(), sub["shift_time_s"].max(), 20)
+            r = float(np.corrcoef(sub["shift_time_s"], sub[metric])[0, 1])
+            ax.plot(xs, np.polyval(coef, xs), "--", color="0.35", lw=1.3)
+            ax.set_title(f"{metric}  (r = {r:.2f})")
+    g.set_axis_labels("shift time [s]", "km/h")
+    g.figure.suptitle("Shift time vs speed drop / shift loss", y=1.03)
+    return _save(g.figure, outdir, name)

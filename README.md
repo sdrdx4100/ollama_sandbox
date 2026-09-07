@@ -16,15 +16,26 @@
 ## なにが解けるのか
 
 AMT は変速中にクラッチを切るため、**必ず駆動トルクが抜けます(トルクホール)**。
-適合(キャリブレーション)エンジニアは次の 3 つの相反する要求のバランスを取ります。
+そこでこのリポジトリは次の 3 点にフォーカスして解析します。
 
-| 目的 | KPI | 小さくしたい理由 |
+1. **変速時間** — 指令からトルク復帰完了まで
+2. **車速の落ち込み** — 変速前後で車速がどれだけ削られたか
+3. **カレントギア(現在ギア)** — どの段の変速が一番効いているか
+
+### 車速の落ち込みは 2 通りで測る
+
+| KPI | 意味 | 使いどころ |
 | --- | --- | --- |
-| 変速ショック | `jerk_rms` / `jerk_peak` [m/s³] | 乗り心地・車両振動 |
-| 変速の速さ | `shift_time_s` [s] | もたつき感・トルク抜け時間 |
-| クラッチ耐久 | `clutch_energy_j` [J] | 発熱・摩耗 |
+| `speed_drop_kmh` | 波形のピーク → 谷の落ち込み幅 | 実測ログからそのまま読める量 |
+| `speed_loss_kmh` | 「変速しなかった場合」との最大差 | 変速そのものが奪った車速 |
 
-本リポジトリは、この 3 目的のトレードオフを **データで可視化し、Optuna で最適な適合値を探索**します。
+全開アップシフトのように**車速は落ちないが伸びが止まる**条件では前者が 0 になり、
+惰行ダウンシフトでは前者に走行抵抗ぶんの減速が混ざります。両方を常に併記し、
+**最適化の目的関数には `speed_loss_kmh`** を使います
+(理由と実測値は [`docs/methodology.md` §3.2](docs/methodology.md) に記載)。
+
+副作用の監視として、変速ショック `jerk_rms` / `jerk_peak`、トルク抜け時間、
+クラッチすべり仕事 `clutch_energy_j` も毎試行記録します。
 
 ## クイックスタート
 
@@ -48,30 +59,55 @@ outputs/
 └── figures/                 seaborn による図一式
 ```
 
-### サンプル結果(`configs/default.yaml`、600 イベント / 実行 90 秒)
+### サンプル結果(`configs/default.yaml`、600 イベント / 実行 92 秒)
 
-| 指標 | ベースライン適合 | Optuna 最適化後 | 変化 |
+Optuna(NSGA-II, 150 試行)による適合最適化のベースライン比:
+
+| 指標 | ベースライン | 最適化後 | 変化 |
 | --- | --- | --- | --- |
-| `jerk_rms` [m/s³] | 8.83 | 6.21 | **−29.6 %** |
-| `jerk_peak`(最悪条件)[m/s³] | 79.4 | 23.6 | **−70.3 %** |
-| `shift_time_s` [s] | 1.000 | 0.948 | −5.2 % |
-| `clutch_energy_j` [J] | 12.8 | 18.2 | +42 %(ショック低減の対価) |
+| `shift_time_s` [s] | 1.000 | 0.822 | **−17.8 %** |
+| `speed_loss_kmh` [km/h] | 7.91 | 6.46 | **−18.3 %** |
+| `speed_drop_kmh` [km/h] | 1.14 | 0.88 | −22.6 % |
+| `torque_interrupt_s` [s] | 0.737 | 0.608 | −17.5 % |
+| `jerk_peak` [m/s³] | 43.0 | 23.3 | −45.9 % |
+| `clutch_energy_j` [J] | 12.8 | 34.6 | **+169 %**(速さの対価) |
 
-代理モデル(`jerk_rms`)の CV 決定係数は **R² = 0.83**。
-運転条件だけで説明した場合は R² = 0.51 なので、**残りは適合値で決まっている**ことが分かります。
+代理モデルの CV 決定係数は `shift_time_s` **R²=0.92** / `speed_loss_kmh` **R²=0.94**。
+**変速時間は運転条件だけでは R²=0.26 しか説明できず(適合値込みで 0.92)、
+ほぼ適合値で決まる**ことが分かります。
 
 <p align="center">
   <img src="docs/images/shift_trace.png" width="52%" alt="変速時系列">
   <img src="docs/images/pareto_front.png" width="46%" alt="パレートフロント">
 </p>
 
-左: 2→3 速アップシフトの時系列(フェーズを色分け。トルクホールと再締結後のシャッフル振動が見える)。
-右: 変速ショック・変速時間・クラッチ仕事のパレートフロント(★ が重み付き最良解)。
+左: 2→3 速アップシフトの時系列。車速パネルに**落ち込み幅(ピーク→谷)と
+「変速しなかった場合」の基準線**を重ねています。
+右: 変速時間 × 車速損失のパレートフロント(色はジャーク、★ が重み付き最良解)。
+
+#### カレントギア別の傾向
+
+![カレントギア別](docs/images/gear_analysis.png)
+
+| 現在ギア | 変速時間 [s] | `speed_drop_kmh` | `speed_loss_kmh` |
+| --- | --- | --- | --- |
+| 1速 → 2速 | 1.35 | 1.45 | **8.81** |
+| 2速 → 3速 | 1.12 | 1.05 | 5.06 |
+| 3速 → 4速 | 1.00 | 1.31 | 2.84 |
+| 4速 → 5速 | 0.84 | 1.32 | 1.89 |
+| 5速 → 6速 | 0.87 | **2.08** | 1.36 |
+
+2 つの指標は**ギヤに対して逆方向**に効きます。損失で見れば最悪は 1→2 速
+(駆動力が大きいぶん奪われる車速も大きい)、実測の落ち込み幅で見れば高速段
+(走行抵抗が大きく実際に減速する)。落ち込み幅だけを見ていると 1→2 速の問題を
+見落とします。
+
+![変速時間と車速の関係](docs/images/speed_time_relation.png)
+
+変速時間の重要度 1 位は**カレントギア**(`from_gear`)、次いで適合値の
+`sync_gain` と `clutch_close_rate` でした。
 
 ![感度解析](docs/images/importance.png)
-
-`throttle` と `speed_kmh`(運転条件)に次いで、`sync_slip_offset` や `torque_reduce_rate` といった
-**適合値がジャークを支配している**ことが permutation importance から読み取れます。
 
 ### 主なコマンド
 
@@ -112,15 +148,30 @@ print(events[["from_gear", "to_gear", "shift_time_s", "jerk_rms", "engine_flare_
 ```python
 from amtlab import ShiftControlParams, ShiftScenario, simulate_shift, extract_kpis
 from amtlab.calibration import calibrate, CalibrationSetting
+from amtlab.dataset import build_dataset
+from amtlab.features import ObjectiveSpec, gear_summary
 
 # 1 回の変速をシミュレーション
 result = simulate_shift(ShiftControlParams(), ShiftScenario(2, 3, speed_kmh=45, throttle=0.6))
-print(extract_kpis(result))
+kpis = extract_kpis(result)
+print(kpis["shift_time_s"], kpis["speed_drop_kmh"], kpis["speed_loss_kmh"])
 
-# 代表条件セットに対して適合値を多目的最適化(NSGA-II)
-outcome = calibrate(CalibrationSetting(), n_trials=150, mode="pareto")
-print(outcome.improvement())
+# カレントギア別の傾向
+print(gear_summary(build_dataset(300)))
+
+# 目的を「変速時間 + 車速損失」の 2 つに絞って多目的最適化
+spec = ObjectiveSpec.from_config(weights={"shift_time_s": 0.5, "speed_loss_kmh": 0.5})
+outcome = calibrate(CalibrationSetting(objectives=spec), n_trials=150, mode="pareto")
+print(outcome.improvement())   # 目的に入れなかった KPI も併記される
 print(outcome.best_control)
+```
+
+目的 KPI は YAML でも差し替えられます。
+
+```yaml
+calibration:
+  objectives: [shift_time_s, speed_loss_kmh]
+  weights: {shift_time_s: 0.5, speed_loss_kmh: 0.5}
 ```
 
 ## Ollama の設定
@@ -144,7 +195,7 @@ CI や LLM 無し環境でもパイプラインは止まりません。
 | `amtlab.simulation.controller` | 変速シーケンス(状態機械)と適合パラメータ 8 種 |
 | `amtlab.simulation.plant` | 4 状態の数値積分(クラッチすべり/ロック、駆動軸ねじり) |
 | `amtlab.dataset` | 実験計画(DoE)とバッチ実行 |
-| `amtlab.features` | 変速品質 KPI の抽出と目的関数 |
+| `amtlab.features` | 変速品質 KPI の抽出・カレントギア別集計・目的関数 |
 | `amtlab.ingest` | 実車ログの取り込み・イベント切り出し |
 | `amtlab.modeling` | scikit-learn 代理モデル・感度解析 |
 | `amtlab.tuning` | Optuna によるハイパーパラメータ探索 |
@@ -159,7 +210,8 @@ CI や LLM 無し環境でもパイプラインは止まりません。
 
 ```bash
 pip install -e ".[dev]"
-pytest -q          # 85 tests / 1 分程度
+pytest -q          # 99 tests / 1 分程度
+ruff check src tests
 ```
 
 ## ライセンス

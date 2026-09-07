@@ -18,13 +18,7 @@ import optuna
 import pandas as pd
 from joblib import Parallel, delayed
 
-from .features import (
-    DEFAULT_WEIGHTS,
-    OBJECTIVE_KPIS,
-    OBJECTIVE_SCALES,
-    extract_kpis,
-    scalar_objective,
-)
+from .features import ObjectiveSpec, extract_kpis, scalar_objective
 from .modeling import SurrogateModel
 from .simulation.controller import CONTROL_BOUNDS, ShiftControlParams
 from .simulation.plant import ShiftScenario, SimSettings, simulate_shift
@@ -46,12 +40,16 @@ def default_scenarios() -> list[ShiftScenario]:
     ]
 
 
+#: 目的関数には入れないが、必ず併記して監視する KPI
+MONITORED_KPIS = ("speed_drop_kmh", "jerk_peak", "clutch_energy_j", "torque_interrupt_s")
+
+
 @dataclass
 class CalibrationSetting:
     scenarios: list[ShiftScenario] = field(default_factory=default_scenarios)
     vehicle: VehicleParams = field(default_factory=VehicleParams)
     sim: SimSettings = field(default_factory=SimSettings)
-    weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
+    objectives: ObjectiveSpec = field(default_factory=ObjectiveSpec)
     worst_case_weight: float = 0.3  # 平均に対する最悪条件のブレンド率
     n_jobs: int = -1
 
@@ -81,17 +79,17 @@ def evaluate_control(
 def aggregate(df: pd.DataFrame, setting: CalibrationSetting) -> dict[str, float]:
     """条件横断の集約指標(平均と最悪値のブレンド)。"""
     agg: dict[str, float] = {}
-    for key in OBJECTIVE_KPIS:
+    keys = list(setting.objectives.keys)
+    for key in keys + [k for k in MONITORED_KPIS if k in df.columns and k not in keys]:
         mean = float(df[key].mean())
         worst = float(df[key].max())
         agg[key] = (1.0 - setting.worst_case_weight) * mean + setting.worst_case_weight * worst
         agg[f"{key}_mean"] = mean
         agg[f"{key}_worst"] = worst
     agg["completed_ratio"] = float(df["completed"].mean())
-    agg["jerk_peak_worst"] = float(df["jerk_peak"].max())
     agg["score"] = scalar_objective(
-        {**{k: agg[k] for k in OBJECTIVE_KPIS}, "completed": agg["completed_ratio"] >= 1.0},
-        setting.weights,
+        {**{k: agg[k] for k in keys}, "completed": agg["completed_ratio"] >= 1.0},
+        setting.objectives,
     )
     return agg
 
@@ -130,6 +128,7 @@ def _surrogate_predict(
 class CalibrationOutcome:
     study: optuna.Study
     mode: str
+    objectives: ObjectiveSpec
     best_control: ShiftControlParams
     best_metrics: dict[str, float]
     baseline_control: ShiftControlParams
@@ -140,7 +139,9 @@ class CalibrationOutcome:
     def improvement(self) -> pd.DataFrame:
         """ベースライン比の改善率(%)。"""
         rows = []
-        for key in (*OBJECTIVE_KPIS, "score", "jerk_peak_worst"):
+        keys = list(self.objectives.keys)
+        extra = [k for k in MONITORED_KPIS if k in self.best_metrics and k not in keys]
+        for key in (*keys, *extra, "score"):
             base = self.baseline_metrics.get(key, np.nan)
             best = self.best_metrics.get(key, np.nan)
             rows.append(
@@ -188,7 +189,8 @@ def calibrate(
                 trial.set_user_attr(k, float(v))
             if surrogates:
                 return scalar_objective(
-                    {**{k: m[k] for k in OBJECTIVE_KPIS}, "completed": 1.0}, setting.weights
+                    {**{k: m[k] for k in setting.objectives.keys}, "completed": 1.0},
+                    setting.objectives,
                 )
             return m["score"]
 
@@ -203,10 +205,10 @@ def calibrate(
             m = metrics_for(control)
             for k, v in m.items():
                 trial.set_user_attr(k, float(v))
-            return tuple(float(m[k]) for k in OBJECTIVE_KPIS)
+            return tuple(float(m[k]) for k in setting.objectives.keys)
 
         study = optuna.create_study(
-            directions=["minimize"] * len(OBJECTIVE_KPIS),
+            directions=["minimize"] * len(setting.objectives.keys),
             sampler=optuna.samplers.NSGAIISampler(seed=seed, population_size=min(40, n_trials)),
             study_name="amt-calibration-pareto",
         )
@@ -217,7 +219,7 @@ def calibrate(
     if mode == "scalar":
         best_control = ShiftControlParams.from_dict(study.best_trial.params)
     else:
-        pareto = pareto_frame(study, setting.weights)
+        pareto = pareto_frame(study, setting.objectives)
         best_row = pareto.sort_values("score").iloc[0]
         best_control = ShiftControlParams.from_dict(best_row.to_dict())
 
@@ -230,6 +232,7 @@ def calibrate(
     return CalibrationOutcome(
         study=study,
         mode=mode,
+        objectives=setting.objectives,
         best_control=best_control,
         best_metrics=best_metrics,
         baseline_control=baseline,
@@ -239,17 +242,17 @@ def calibrate(
     )
 
 
-def pareto_frame(study: optuna.Study, weights: dict[str, float] | None = None) -> pd.DataFrame:
+def pareto_frame(study: optuna.Study, objectives: ObjectiveSpec | None = None) -> pd.DataFrame:
     """多目的探索のパレート解を DataFrame 化する。"""
-    weights = weights or DEFAULT_WEIGHTS
+    spec = objectives or ObjectiveSpec()
     rows = []
     for t in study.best_trials:
         row = {"trial": t.number}
-        row.update({k: v for k, v in zip(OBJECTIVE_KPIS, t.values)})
+        row.update({k: v for k, v in zip(spec.keys, t.values)})
         row.update(t.params)
+        row.update({k: v for k, v in t.user_attrs.items() if isinstance(v, (int, float))})
         row["score"] = sum(
-            weights.get(k, 0.0) * v / OBJECTIVE_SCALES.get(k, 1.0)
-            for k, v in zip(OBJECTIVE_KPIS, t.values)
+            spec.weights[k] * v / spec.scale(k) for k, v in zip(spec.keys, t.values)
         )
         rows.append(row)
     return pd.DataFrame(rows).sort_values("score").reset_index(drop=True)

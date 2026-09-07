@@ -24,7 +24,7 @@ def test_pipeline_produces_every_artifact(tmp_path, small_dataset):
     cfg = PipelineConfig.from_dict(
         {
             "output_dir": str(tmp_path / "out"),
-            "model": {"targets": ["jerk_rms", "shift_time_s"], "n_trials": 3,
+            "model": {"targets": ["shift_time_s", "speed_loss_kmh"], "n_trials": 3,
                       "n_splits": 3, "model_names": ["ridge"], "permutation_repeats": 2},
             "calibration": {"n_trials": 8, "mode": "scalar"},
             "ollama": {"enabled": False},
@@ -36,7 +36,7 @@ def test_pipeline_produces_every_artifact(tmp_path, small_dataset):
     assert (root / "data" / "dataset.csv").exists()
     assert (root / "config.used.yaml").exists()
     for name in ("importance.csv", "improvement.csv", "calibration_params.csv",
-                 "tuning_history.csv", "calibration_comparison.csv"):
+                 "tuning_history.csv", "calibration_comparison.csv", "gear_summary.csv"):
         assert (root / "tables" / name).exists()
     for target in cfg.model.targets:
         assert (root / "models" / f"surrogate_{target}.joblib").exists()
@@ -47,4 +47,9 @@ def test_pipeline_produces_every_artifact(tmp_path, small_dataset):
     summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
     assert summary["dataset"]["n_events"] == len(small_dataset)
     assert summary["calibration"]["mode"] == "scalar"
+    assert summary["objectives"]["keys"] == list(cfg.calibration.objectives)
+    assert summary["by_current_gear"], "カレントギア別の集計がレポートに含まれること"
+    assert {"gear_analysis.png", "speed_time_relation.png"} <= {
+        p.name for p in art.figures
+    }
     assert art.calibration.best_control.clipped() == art.calibration.best_control

@@ -103,7 +103,8 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
 
     cfg = PipelineConfig.load(args.config)
     setting = CalibrationSetting(
-        weights=cfg.calibration.weights, worst_case_weight=cfg.calibration.worst_case_weight
+        objectives=cfg.calibration.objective_spec(),
+        worst_case_weight=cfg.calibration.worst_case_weight,
     )
     outcome = calibrate(
         setting=setting,
@@ -120,7 +121,8 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
                      ensure_ascii=False, indent=2))
     if len(outcome.pareto):
         outcome.pareto.to_csv(out / "tables" / "pareto_front.csv", index=False)
-        print(f"figure: {viz.plot_pareto(outcome.pareto, out / 'figures')}")
+        fig = viz.plot_pareto(outcome.pareto, out / "figures", keys=setting.objectives.keys)
+        print(f"figure: {fig}")
     return 0
 
 

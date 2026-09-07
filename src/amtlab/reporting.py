@@ -29,8 +29,12 @@ Markdown で技術レポートを書いてください。構成は次の通り�
 
 1. サマリ(3行以内)
 2. 変速品質を支配している因子(permutation importance と相関から)
-3. 最適化された適合値の妥当性(ベースライン比の改善と悪化のトレードオフ)
-4. 残課題と次に取るべき計測・実験
+3. カレントギア(現在ギア)別の傾向 — どの段の変速時間・車速落ち込みが問題か
+4. 最適化された適合値の妥当性(ベースライン比の改善と悪化のトレードオフ)
+5. 残課題と次に取るべき計測・実験
+
+車速の指標は 2 種類ある。speed_drop_kmh は実測波形のピーク→谷の落ち込み幅、
+speed_loss_kmh は「変速しなかった場合」との差(伸びの停滞を含む)。混同しないこと。
 
 数値は JSON の値をそのまま引用し、単位を明記してください。
 """
@@ -96,11 +100,13 @@ def build_summary(
     importance: pd.DataFrame,
     calibration_outcome,
     tuning: dict[str, Any] | None = None,
+    gears: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """LLM とテンプレートの双方に渡す解析サマリ(JSON 化可能)を作る。"""
 
-    kpis = ["shift_time_s", "jerk_rms", "jerk_peak", "clutch_energy_j",
-            "torque_interrupt_s", "engine_flare_rpm"]
+    kpis = [c for c in ("shift_time_s", "speed_drop_kmh", "speed_loss_kmh",
+                        "torque_interrupt_s", "jerk_rms", "jerk_peak")
+            if c in dataset.columns]
     describe = dataset[kpis].describe().loc[["mean", "std", "min", "max"]].round(3)
 
     imp = importance.head(8)[["feature", "importance", "kind"]].round(4)
@@ -131,6 +137,10 @@ def build_summary(
             "n_pareto_solutions": int(len(calibration_outcome.pareto)),
         },
     }
+    if gears is not None and len(gears):
+        cols = [c for c in gears.columns if c.endswith("_mean") or c in
+                ("current_gear", "direction")]
+        summary["by_current_gear"] = gears[cols].round(3).to_dict(orient="records")
     if tuning:
         summary["hyperparameter_tuning"] = tuning
     return summary
@@ -164,7 +174,21 @@ def fallback_report(summary: dict[str, Any]) -> str:
     for row in summary["top_importance"]:
         lines.append(f"| {row['feature']} | {row['kind']} | {row['importance']:.4f} |")
 
-    lines += ["", "## 3. 適合値の最適化結果", "",
+    if summary.get("by_current_gear"):
+        lines += ["", "## 3. カレントギア(現在ギア)別の傾向", "",
+                  "| 現在ギア | 方向 | 変速時間 [s] | 車速落ち込み [km/h] | 車速損失 [km/h] |",
+                  "| --- | --- | --- | --- | --- |"]
+        for row in summary["by_current_gear"]:
+            lines.append(
+                f"| {row['current_gear']} | {row['direction']} | "
+                f"{row.get('shift_time_s_mean', float('nan')):.2f} | "
+                f"{row.get('speed_drop_kmh_mean', float('nan')):.2f} | "
+                f"{row.get('speed_loss_kmh_mean', float('nan')):.2f} |"
+            )
+        lines += ["",
+                  "※ 車速落ち込み = 実測のピーク→谷、車速損失 = 変速しなかった場合との差。"]
+
+    lines += ["", "## 4. 適合値の最適化結果", "",
               "| 指標 | ベースライン | 最適化後 | 改善率 [%] |", "| --- | --- | --- | --- |"]
     for row in cal["improvement"]:
         lines.append(
@@ -179,7 +203,7 @@ def fallback_report(summary: dict[str, Any]) -> str:
 
     lines += [
         "",
-        "## 4. 残課題",
+        "## 5. 残課題",
         "- 実車ログでのモデル妥当性確認(プラントモデルのパラメータ同定)",
         "- 低速段(1→2速)大トルク域のショック低減",
         "- クラッチ発熱・耐久を含めた長時間走行での検証",

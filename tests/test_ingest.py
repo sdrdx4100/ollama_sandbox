@@ -51,8 +51,11 @@ def test_event_kpis_match_the_simulation_schema(demo_log):
     trace = standardize(demo_log)
     kpis = event_kpis(trace, detect_shift_events(trace)[0])
     for key in ("shift_time_s", "jerk_rms", "jerk_peak", "engine_flare_rpm",
-                "speed_loss_kmh", "is_upshift"):
+                "speed_drop_kmh", "speed_drop_pct", "speed_loss_kmh",
+                "current_gear", "is_upshift"):
         assert key in kpis
+    assert kpis["current_gear"] == kpis["from_gear"]
+    assert kpis["speed_drop_kmh"] >= 0.0
     assert kpis["shift_time_s"] > 0
     assert kpis["neutral_time_s"] > 0
 

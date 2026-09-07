@@ -9,7 +9,7 @@ from amtlab.calibration import (
     evaluate_control,
     pareto_frame,
 )
-from amtlab.features import OBJECTIVE_KPIS
+from amtlab.features import OBJECTIVE_KPIS, ObjectiveSpec
 from amtlab.simulation import ShiftControlParams
 
 
@@ -21,7 +21,26 @@ def setting():
 def test_evaluate_control_covers_every_scenario(setting):
     df = evaluate_control(ShiftControlParams(), setting)
     assert len(df) == len(setting.scenarios)
-    assert {"jerk_rms", "shift_time_s", "clutch_energy_j"} <= set(df.columns)
+    assert {"jerk_rms", "shift_time_s", "speed_drop_kmh", "speed_loss_kmh"} <= set(df.columns)
+
+
+def test_monitored_kpis_are_reported_even_when_not_optimised(setting):
+    from amtlab.calibration import MONITORED_KPIS
+
+    agg = aggregate(evaluate_control(ShiftControlParams(), setting), setting)
+    for key in MONITORED_KPIS:
+        assert key in agg and f"{key}_worst" in agg
+    assert "speed_drop_kmh" not in setting.objectives.keys  # 目的ではなく監視対象
+
+
+def test_two_objective_setting_runs(setting):
+    spec = ObjectiveSpec.from_config(
+        weights={"shift_time_s": 0.5, "speed_loss_kmh": 0.5}
+    )
+    two = CalibrationSetting(scenarios=setting.scenarios, objectives=spec, n_jobs=1)
+    outcome = calibrate(setting=two, n_trials=12, mode="pareto", seed=0)
+    assert list(outcome.pareto.columns[:3]) == ["trial", "shift_time_s", "speed_loss_kmh"]
+    assert set(outcome.improvement()["metric"]) >= {"shift_time_s", "speed_loss_kmh"}
 
 
 def test_aggregate_blends_mean_and_worst(setting):
