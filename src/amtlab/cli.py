@@ -286,7 +286,8 @@ def cmd_demo_log(args: argparse.Namespace) -> int:
     from .ingest import make_demo_log, make_j1939_demo_log
 
     if args.j1939:
-        log = make_j1939_demo_log(sample_hz=args.sample_hz, seed=args.seed)
+        log = make_j1939_demo_log(sample_hz=args.sample_hz, seed=args.seed,
+                                  naming=args.naming)
     else:
         log = make_demo_log(sample_hz=args.sample_hz, seed=args.seed)
     out = Path(args.out)
@@ -393,6 +394,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_dl.add_argument("--seed", type=int, default=0)
     p_dl.add_argument("--j1939", action="store_true",
                       help="J1939 の信号名・単位・更新周期で出力する")
+    p_dl.add_argument("--naming", choices=["short", "long"], default="short",
+                      help="信号名の書き方 (short: TransShiftInProcess)")
     p_dl.set_defaults(func=cmd_demo_log)
 
     p_ins = sub.add_parser("inspect", help="ログの信号構成とサンプルレートを診断")

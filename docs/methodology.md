@@ -214,8 +214,13 @@ DoE 400 イベントでの実測(本モデル):
    「大文字+数字」トークン(`EEC1`)の後ろの `_`。小文字のトークンは
    プレフィックス扱いしない(`engine_speed` を割らないため)。
    外した本体と外さない全体の両方で照合するので、外して失敗することはない。
-2. UpperCamelCase を単語に分解する
-   (`TransmissionCurrentGear` → `transmission_current_gear`)。
+2. UpperCamelCase を単語に分解する(`TransCurrentGear` → `trans_current_gear`)。
+   さらに**略語をトークン単位で正式形に展開**する
+   (`trans` → `transmission`、`eng` → `engine`、`accel` → `accelerator`、
+   `pos` → `position` など、``amtlab.j1939.ABBREVIATIONS``)。
+   これにより別名パターンは正式形だけ書けばよくなる。
+   トークン単位の完全一致でのみ展開するので、`TransDrivelineEngaged` の
+   `Engaged` が `Engine` に化けることはない。
 3. スコアリング: SPN 番号の一致 +3.0、別名の一致 +2.0(全体でのみ一致なら +1.5、
    別名リストの後ろほど −0.1 の減点)、プレフィックスが期待 PGN と一致 +1.0。
 4. 全 (信号, 列) の組をスコア順に貪欲割り当てし、各列は最大 1 信号に割り当てる。

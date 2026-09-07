@@ -138,13 +138,13 @@ amtlab ingest  --log mylog.csv    # 変速イベントを切り出して KPI 化
 `inspect` は検出できた SPN・**実効サンプルレート**・注意点を出します。
 
 ```
-  SPN  内部名                   列名                                   実効Hz  信号
-   84  speed_kmh             CCVS1::WheelBasedVehicleSpeed        10.0  ホイールベース車速
-  190  engine_speed_rpm      EEC1::EngineSpeed                    50.0  エンジン回転数
-  191  output_shaft_rpm      ETC1::TransmissionOutputShaftSpeed   50.0  アウトプットシャフト回転数
-  522  clutch_slip_pct       ETC1::PercentClutchSlip              50.0  クラッチ滑り率
-  523  gear                  ETC2::TransmissionCurrentGear          離散  現在のギア位置
-  574  shift_in_process      ETC1::TransmissionShiftInProcess       離散  トランスシフトインプロセス
+  SPN  内部名                   列名                            実効Hz  信号
+   84  speed_kmh             CCVS1::WheelBasedVehicleSpeed   10.0  ホイールベース車速
+  190  engine_speed_rpm      EEC1::EngSpeed                  50.0  エンジン回転数
+  191  output_shaft_rpm      ETC1::TransOutputShaftSpeed     50.0  アウトプットシャフト回転数
+  522  clutch_slip_pct       ETC1::PercentClutchSlip         50.0  クラッチ滑り率
+  523  gear                  ETC2::TransCurrentGear            離散  現在のギア位置
+  574  shift_in_process      ETC1::TransShiftInProcess         離散  トランスシフトインプロセス
 
 マッピングされなかった列 (2):
   CCVS1::ParkingBrakeSwitch
@@ -161,8 +161,13 @@ amtlab ingest  --log mylog.csv    # 変速イベントを切り出して KPI 化
   `engine_speed` を `engine` + `speed` に割ってしまわないよう、小文字のトークンは
   プレフィックス扱いしません。外した本体と外さない全体の**両方**で照合するので、
   外して失敗することはありません。
-- **UpperCamelCase を単語に分解**します(`TransmissionCurrentGear` →
-  `transmission_current_gear`)。
+- **UpperCamelCase を単語に分解**します(`TransCurrentGear` →
+  `trans_current_gear`)。
+- **略語をトークン単位で正式形に展開**します。DBC は
+  `Transmission` → `Trans`、`Engine` → `Eng`、`Accelerator` → `Accel` のように
+  略すのが普通なので、`TransShiftInProcess` → `transmission_shift_in_process`、
+  `EngSpeed` → `engine_speed` に寄せてから照合します。トークン単位なので
+  `TransDrivelineEngaged` の `Engaged` が `Engine` に化けることはありません。
 - プレフィックスがその SPN の PGN と一致していれば**加点**します
   (`ETC1::` + シフトインプロセス など)。
 - 別名は**特異度順**に評価します。たとえば SPN 512 (`DriversDemandEnginePercentTorque`)

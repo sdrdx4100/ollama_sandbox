@@ -26,7 +26,7 @@ def log_dir(tmp_path_factory):
             root / f"drive_{i:02d}.parquet", index=False
         )
     legacy = make_j1939_demo_log(n_shifts=3, seed=99).drop(
-        columns=["ETC1::TransmissionShiftInProcess", "ETC1::PercentClutchSlip"]
+        columns=["ETC1::TransShiftInProcess", "ETC1::PercentClutchSlip"]
     )
     legacy.to_parquet(root / "legacy.parquet", index=False)
     (root / "broken.parquet").write_bytes(b"not a parquet file")
@@ -59,12 +59,12 @@ def test_missing_pattern_returns_nothing(tmp_path):
 # --- 列だけ読む ------------------------------------------------------------------
 def test_schema_is_read_without_loading_data(log_dir):
     schema = read_log_schema(log_dir / "drive_00.parquet")
-    assert "EEC1::EngineSpeed" in schema
-    assert "ETC1::TransmissionShiftInProcess" in schema
+    assert "EEC1::EngSpeed" in schema
+    assert "ETC1::TransShiftInProcess" in schema
 
 
 def test_csv_schema_too(log_dir):
-    assert "EEC1::EngineSpeed" in read_log_schema(log_dir / "as_csv.csv")
+    assert "EEC1::EngSpeed" in read_log_schema(log_dir / "as_csv.csv")
 
 
 def test_load_log_reads_only_the_mapped_columns(log_dir, tmp_path):

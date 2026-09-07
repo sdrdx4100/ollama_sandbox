@@ -100,6 +100,61 @@ def test_upper_camel_case_with_prefix_is_detected():
     assert len(mapping) == len(columns)  # 全列が別々の信号に割り当たる
 
 
+def test_standard_dbc_short_names_are_detected():
+    """``Transmission`` → ``Trans``、``Engine`` → ``Eng`` の短縮形に対応する。"""
+    expected = {
+        "Timestamp": "time",
+        "EEC1::EngSpeed": "engine_speed_rpm",
+        "EEC1::ActualEngPercentTorque": "actual_torque_pct",
+        "EEC1::DriversDemandEngPercentTorque": "demand_torque_pct",
+        "EEC1::EngNominalFrictionPercentTorque": "friction_torque_pct",
+        "EC1::EngReferenceTorque": "reference_torque_nm",
+        "EEC2::AccelPedalPos1": "accel_pedal_pct",
+        "CCVS1::WheelBasedVehicleSpeed": "speed_kmh",
+        "EBC2::FrontAxleSpeed": "front_axle_speed_kmh",
+        "ETC1::TransInputShaftSpeed": "input_shaft_rpm",
+        "ETC1::TransOutputShaftSpeed": "output_shaft_rpm",
+        "ETC1::PercentClutchSlip": "clutch_slip_pct",
+        "ETC1::TransShiftInProcess": "shift_in_process",
+        "ETC2::TransCurrentGear": "gear",
+        "ETC2::TransSelectedGear": "selected_gear",
+        "ETC2::TransActualGearRatio": "gear_ratio",
+    }
+    mapping = detect_columns(pd.DataFrame(columns=list(expected)))
+    assert {v: k for k, v in mapping.items()} == expected
+
+
+def test_short_and_long_names_resolve_identically():
+    short = make_j1939_demo_log(n_shifts=2, seed=1, naming="short")
+    long = make_j1939_demo_log(n_shifts=2, seed=1, naming="long")
+    assert set(detect_columns(short)) == set(detect_columns(long))
+    assert list(short.columns) != list(long.columns)
+
+
+@pytest.mark.parametrize(
+    "raw,expanded",
+    [
+        ("TransShiftInProcess", "transmission_shift_in_process"),
+        ("EngSpeed", "engine_speed"),
+        ("AccelPedalPos1", "accelerator_pedal_position_1"),
+        ("ActualEngPercentTorque", "actual_engine_percent_torque"),
+        # 部分一致では展開しない(Engaged の eng を engine にしない)
+        ("TransDrivelineEngaged", "transmission_driveline_engaged"),
+        ("EngineSpeed", "engine_speed"),
+    ],
+)
+def test_abbreviations_are_expanded_token_wise(raw, expanded):
+    assert _normalize(raw) == expanded
+
+
+def test_abbreviated_decoy_is_still_rejected():
+    """短縮形でも SPN 512 と SPN 2432 を取り違えない。"""
+    columns = ["Timestamp", "EEC1::EngSpeed", "CCVS1::WheelBasedVehicleSpeed",
+               "EEC1::DriversDemandEngPercentTorque", "EEC1::EngDemandPercentTorque"]
+    mapping = detect_columns(pd.DataFrame(columns=columns))
+    assert mapping["demand_torque_pct"] == "EEC1::DriversDemandEngPercentTorque"
+
+
 def test_specific_alias_beats_a_similar_signal():
     """SPN 512(Driver's Demand)と SPN 2432(Engine Demand)を取り違えない。"""
     columns = [
@@ -305,7 +360,7 @@ def test_signal_map_file_overrides_auto_detection(j1939_log, tmp_path):
     sm = SignalMap.from_file(path)
     mapping = sm.resolve(j1939_log)
     assert mapping["speed_kmh"] == "EBC2::FrontAxleSpeed"
-    assert mapping["engine_speed_rpm"] == "EEC1::EngineSpeed"  # 残りは自動検出
+    assert mapping["engine_speed_rpm"] == "EEC1::EngSpeed"  # 残りは自動検出
 
 
 def test_signal_map_file_rejects_unknown_keys(tmp_path):

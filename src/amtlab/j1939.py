@@ -143,11 +143,45 @@ def to_seconds(series: pd.Series) -> pd.Series:
     return values
 
 
+#: DBC でよく使われる略語 → 正式形(**トークン単位**で完全一致した場合のみ展開)
+#:
+#: J1939 の DBC は ``TransShiftInProcess`` ``EngSpeed`` のように略すことが多い。
+#: 正規化の段階で正式形に寄せておけば、別名パターンは正式形だけ書けばよい。
+#: トークン単位なので ``Engaged`` の ``eng`` のような部分一致では展開されない。
+ABBREVIATIONS: dict[str, str] = {
+    "eng": "engine",
+    "trans": "transmission",
+    "tcm": "transmission",
+    "accel": "accelerator",
+    "acc": "accelerator",
+    "pos": "position",
+    "ref": "reference",
+    "spd": "speed",
+    "veh": "vehicle",
+    "pct": "percent",
+    "act": "actual",
+    "actl": "actual",
+    "sel": "selected",
+    "cur": "current",
+    "curr": "current",
+    "dmd": "demand",
+    "drv": "driver",
+    "clu": "clutch",
+    "shft": "shaft",
+    "trq": "torque",
+    "tq": "torque",
+}
+
+
 def _normalize(name: str) -> str:
     """列名を突き合わせ用に正規化する。
 
-    UpperCamelCase を単語に割ってから小文字化し、記号を ``_`` に統一する。
-    ``TransmissionCurrentGear`` → ``transmission_current_gear``
+    1. UpperCamelCase を単語に割る
+    2. 小文字化して記号を ``_`` に統一する
+    3. 略語トークンを正式形に展開する
+
+    ``TransShiftInProcess`` → ``transmission_shift_in_process``
+    ``EngSpeed`` → ``engine_speed``
     """
 
     text = str(name).strip()
@@ -156,7 +190,8 @@ def _normalize(name: str) -> str:
     text = re.sub(r"(?<=[A-Za-z])(?=[0-9])", "_", text)  # a1   -> a_1
     text = text.lower()
     text = re.sub(r"[\s\-\./\[\]\(\)（）:：|]+", "_", text)
-    return re.sub(r"_+", "_", text).strip("_")
+    text = re.sub(r"_+", "_", text).strip("_")
+    return "_".join(ABBREVIATIONS.get(token, token) for token in text.split("_"))
 
 
 #: 対応 SPN のカタログ
@@ -195,7 +230,7 @@ J1939_CATALOG: tuple[J1939Signal, ...] = (
     ),
     J1939Signal(
         "engine_speed_rpm", 190, "EEC1", "Engine Speed", "エンジン回転数", "rpm",
-        (r"engine_?speed", r"^ne$", r"^rpm$", r"エンジン回転"), 50.0,
+        (r"engine_?speed", r"engine_?rpm", r"^ne$", r"^rpm$", r"エンジン回転"), 50.0,
     ),
     J1939Signal(
         "speed_kmh", 84, "CCVS1", "Wheel-Based Vehicle Speed",

@@ -636,8 +636,28 @@ def make_demo_log(
 
 
 # ----------------------------------------------------------------------
-#: J1939 デモログの列名(SPN 名に寄せた、よくあるロガー出力の形)
+#: J1939 デモログの列名(標準的な DBC の短縮形。``Transmission`` → ``Trans``、
+#: ``Engine`` → ``Eng`` など)
 J1939_DEMO_COLUMNS = {
+    "time": "Timestamp",
+    "accel_pedal_pct": "EEC2::AccelPedalPos1",
+    "demand_torque_pct": "EEC1::DriversDemandEngPercentTorque",
+    "actual_torque_pct": "EEC1::ActualEngPercentTorque",
+    "reference_torque_nm": "EC1::EngReferenceTorque",
+    "engine_speed_rpm": "EEC1::EngSpeed",
+    "speed_kmh": "CCVS1::WheelBasedVehicleSpeed",
+    "front_axle_speed_kmh": "EBC2::FrontAxleSpeed",
+    "input_shaft_rpm": "ETC1::TransInputShaftSpeed",
+    "output_shaft_rpm": "ETC1::TransOutputShaftSpeed",
+    "clutch_slip_pct": "ETC1::PercentClutchSlip",
+    "shift_in_process": "ETC1::TransShiftInProcess",
+    "gear": "ETC2::TransCurrentGear",
+    "selected_gear": "ETC2::TransSelectedGear",
+    "gear_ratio": "ETC2::TransActualGearRatio",
+}
+
+#: 略さない書き方のロガーもあるので、こちらも生成できるようにしておく
+J1939_DEMO_COLUMNS_LONG = {
     "time": "Timestamp",
     "accel_pedal_pct": "EEC2::AcceleratorPedalPosition1",
     "demand_torque_pct": "EEC1::DriversDemandEnginePercentTorque",
@@ -689,9 +709,13 @@ def make_j1939_demo_log(
     start_gear: int = 1,
     sample_hz: float = 100.0,
     seed: int = 0,
+    naming: str = "short",
 ) -> pd.DataFrame:
     """シミュレーション結果を **J1939 の信号名・単位・更新周期** に変換した
     デモログを作る。取り込み経路(自動検出 → イベント切り出し)の確認用。
+
+    ``naming="short"`` は標準的な DBC の短縮形(``ETC1::TransShiftInProcess``)、
+    ``"long"`` は略さない形(``ETC1::TransmissionShiftInProcess``)。
 
     実車ログを模して次を再現する。
 
@@ -795,4 +819,5 @@ def make_j1939_demo_log(
     for col in ("demand_torque_pct", "actual_torque_pct"):
         log[col] = np.round(log[col])  # 1 %/bit
 
-    return log.rename(columns=J1939_DEMO_COLUMNS)
+    columns = J1939_DEMO_COLUMNS if naming == "short" else J1939_DEMO_COLUMNS_LONG
+    return log.rename(columns=columns)
