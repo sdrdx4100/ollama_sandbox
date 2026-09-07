@@ -1,0 +1,148 @@
+# モデルと解析手法
+
+## 1. プラントモデル
+
+```
+エンジン(J_e) ──クラッチ(容量 T_cap)── 変速機(i_g·i_f) ── 駆動軸(k, c) ── 車体(M)
+```
+
+状態量は 4 つ:エンジン角速度 `ω_e`、車輪角速度 `ω_w`、駆動軸ねじり角 `θ`、車速 `v`。
+刻み 1 ms の semi-implicit Euler で積分します(`amtlab/simulation/plant.py`)。
+
+### 運動方程式
+
+エンジン側
+
+$$J_e \dot{\omega}_e = T_e - T_c$$
+
+車輪側(ギヤ締結時。ニュートラルでは `T_c = 0`)
+
+$$J_{gw}\,\dot{\omega}_w = T_c\, i_g i_f\, \eta - T_{shaft},\qquad
+J_{gw} = J_w + J_{in}\,(i_g i_f)^2$$
+
+駆動軸(ねじり 2 慣性)
+
+$$T_{shaft} = k\,\theta + c\left(\omega_w - \frac{v}{r_w}\right),\qquad
+\dot{\theta} = \omega_w - \frac{v}{r_w}$$
+
+車体
+
+$$M\dot{v} = \frac{T_{shaft}}{r_w} - F_{road},\qquad
+F_{road} = \tfrac12 \rho C_dA\,v|v| + M g \mu_r \tanh\!\left(\tfrac{v}{0.5}\right) + Mg\sin\phi$$
+
+### クラッチのすべり/ロック
+
+- 容量: `T_cap(x) = T_cap,max · ((x - x_kiss)/(1 - x_kiss))^1.6`(`x` はストローク比、ミート点以下は 0)
+- **すべり中**: `T_c = T_cap · sign(ω_e - ω_in)`
+- **ロック中**: 両側を剛結合として必要伝達トルクを解き、`|T_c| > T_cap` になったらすべりへ遷移
+
+$$\dot{\omega}_w = \frac{T_e\,i\,\eta - T_{shaft}}{J_{gw} + J_e i^2 \eta},\qquad
+T_c = T_e - J_e\, i\, \dot{\omega}_w$$
+
+- すべり収束時(`|ω_e - ω_in| < 1.5 rad/s`)は角運動量を保存して締結します。
+
+駆動軸剛性 `k = 4000 Nm/rad`、減衰 `c = 30 Nms/rad` は、実車で問題になる
+**2〜8 Hz のシャッフル振動**(本モデルでは約 6.7 Hz)を再現するための値です。
+これによりクラッチ再締結の速さがジャーク指標に効くようになります。
+
+### エンジン
+
+全開トルクマップの線形補間と、全閉時の引きずりトルク `-(10 + 0.008·rpm)` を
+スロットル開度で内挿。トルク指令には時定数 60 ms の一次遅れを入れています。
+
+## 2. 変速シーケンス(状態機械)
+
+`amtlab/simulation/controller.py`。AMT は単板クラッチなので、以下を順に実行します。
+
+| # | フェーズ | 内容 | 効く適合値 |
+| --- | --- | --- | --- |
+| 1 | `torque_reduce` | エンジントルクを落とす | `torque_reduce_rate` |
+| 2 | `clutch_open` | クラッチ解放 | `clutch_open_rate` |
+| 3 | `gear_out` | ギヤ抜き(ニュートラル) | — |
+| 4 | `speed_sync` | エンジン回転を締結先へ同期(アップ=引きずり、ダウン=空吹かし) | `sync_gain`, `sync_slip_offset` |
+| 5 | `gear_in` | ギヤ入れ | — |
+| 6 | `clutch_close` | ミート点まで早戻し → 締結 | `kiss_approach_rate`, `clutch_close_rate` |
+| 7 | `torque_recovery` | ドライバ要求トルクへ復帰 | `torque_recovery_slip`, `torque_recovery_rate` |
+
+3〜5 の間は駆動トルクがゼロ = **トルクホール**。各フェーズにはタイムアウトを設け、
+異常な適合値でもシミュレーションが発散・無限ループしないようにしています
+(打ち切られた場合 `completed = 0` となり目的関数でペナルティを受けます)。
+
+適合パラメータの探索範囲は `amtlab.simulation.controller.CONTROL_BOUNDS` に集約しており、
+DoE のサンプリングと Optuna の探索空間の両方がここを参照します。
+
+## 3. 変速品質 KPI
+
+`amtlab/features.py`。評価窓は「変速指令 〜 変速完了 + 0.6 s」。
+
+| KPI | 定義 |
+| --- | --- |
+| `shift_time_s` | 変速指令からトルク復帰完了まで |
+| `torque_interrupt_s` | 駆動軸トルクが変速前の 20% を下回る時間 |
+| `jerk_rms`, `jerk_peak` | 加速度(10 Hz ゼロ位相ローパス)の時間微分の RMS / 最大 |
+| `accel_drop` | 変速前加速度からの落ち込み量 |
+| `clutch_energy_j` | `∫ \|T_c · Δω\| dt`(すべり仕事) |
+| `engine_flare_rpm` | 変速中のエンジン回転が「開始回転 or 同期先回転」を超えた量 |
+| `speed_loss_kmh` | 変速前車速からの落ち込み |
+| `quality_score` | 主要 3 KPI を正規化した重み付き和(小さいほど良い) |
+
+`OBJECTIVE_SCALES` で各 KPI を代表的な良品レベル(ジャーク 6 m/s³、変速時間 1 s、
+クラッチ仕事 500 J)で正規化してからスカラー化しています。
+
+## 4. データ生成(DoE)
+
+`amtlab/dataset.py` はランダム DoE で「運転条件 × 適合値」を一様サンプリングします。
+
+- 運転条件: 変速段組(隣接段のみ)、車速(エンジン回転が実用域に入るよう逆算)、
+  スロットル、勾配 −6〜+8 %、積載 0〜400 kg
+- 適合値: `CONTROL_BOUNDS` の一様乱数
+
+1 行 = 1 変速イベント。joblib で並列実行し、600 イベントで数十秒です。
+
+## 5. 代理モデルと感度解析
+
+`amtlab/modeling.py` / `amtlab/tuning.py`。
+
+- 前処理: ギヤ段は One-Hot、連続量は標準化(`ColumnTransformer`)
+- モデル: `HistGradientBoosting` / `RandomForest` / `ExtraTrees` / `RidgeCV`
+- 評価: 5-fold CV の OOF 予測で RMSE・MAE・R²
+- **Optuna(TPE)がモデル種別ごとハイパーパラメータを探索**し、CV RMSE を最小化
+- 感度解析: permutation importance(R² 低下量)と部分依存(PDP)
+- `condition_only_baseline` は「運転条件だけで説明した場合」の R² を出し、
+  **適合値がどれだけ説明力を足しているか**を切り分けます
+
+## 6. 適合最適化
+
+`amtlab/calibration.py`。代表運転条件 7 点(低速段の大トルク変速、登坂 + 積載、
+ダウンシフトを含む)に対して 1 組の適合値を評価します。
+
+- 集約: 条件平均と最悪条件を `worst_case_weight`(既定 0.3)でブレンド
+  → **どの条件でも破綻しない適合値**を要求する
+- `scalar` モード: TPE で重み付きスカラー目的を最小化
+- `pareto` モード: NSGA-II で(ジャーク, 変速時間, クラッチ仕事)を多目的最適化し、
+  パレート解の中から重み付き最良解を代表値として選ぶ
+- `use_surrogate: true` にすると評価を代理モデル予測で行い高速化。
+  ただし **最終的な best/baseline の指標は必ずシミュレーションで再評価**します。
+
+## 7. 実車ログの取り込み
+
+`amtlab/ingest.py`。
+
+1. 列名マッピング(`SignalMap`)→ 等時間間隔へリサンプル(ギヤは最近傍補間)
+2. 加速度が無ければ車速から算出、10 Hz ローパス後に微分してジャークを算出
+3. ギヤ信号の遷移(ニュートラル経由に対応)から変速イベントを切り出し、
+   締結完了は「エンジン回転と締結先入力軸回転の一致」で判定
+4. シミュレーションと同じ KPI スキーマの表を出力
+
+`make_demo_log()` は各セグメントの終端車速・ギヤを次に引き継いで
+連続した加速ログを合成するので、取り込み経路の動作確認に使えます。
+
+## 8. モデルの限界
+
+本モデルは適合の**トレードオフ構造を再現する**ことを目的とした簡易モデルです。
+実車適合に用いる場合は、少なくとも次の同定・拡張が必要です。
+
+- クラッチ容量特性(温度・摩耗依存)とアクチュエータ応答の実測同定
+- 駆動軸剛性・減衰、エンジンマウント剛性の同定(シャッフル周波数の合わせ込み)
+- タイヤすべり、ブレーキ、勾配推定誤差
+- 変速線(いつ変速するか)の最適化は本モデルの対象外(ここでは「どう変速するか」のみ)

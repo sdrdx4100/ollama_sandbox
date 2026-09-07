@@ -1,0 +1,34 @@
+# AMT 変速品質 解析パイプライン設定
+output_dir: outputs
+
+dataset:
+  n_samples: 600      # ランダム DoE で生成する変速イベント数
+  seed: 0
+  n_jobs: -1
+
+model:
+  targets: [jerk_rms, shift_time_s, clutch_energy_j]
+  primary_target: jerk_rms
+  n_trials: 40        # Optuna によるハイパーパラメータ探索回数
+  n_splits: 5
+  model_names: [hist_gbr, random_forest, extra_trees, ridge]
+  permutation_repeats: 10
+
+calibration:
+  n_trials: 150       # Optuna による適合値探索回数
+  mode: pareto        # scalar | pareto (NSGA-II)
+  seed: 0
+  use_surrogate: false  # true にすると代理モデルで高速探索
+  worst_case_weight: 0.3
+  weights:
+    jerk_rms: 0.5
+    shift_time_s: 0.35
+    clutch_energy_j: 0.15
+
+ollama:
+  enabled: true
+  host: http://localhost:11434
+  model: qwen2.5:7b
+  temperature: 0.3
+  timeout_s: 180
+  language: ja
