@@ -40,7 +40,8 @@ AMT は変速中にクラッチを切るため、**必ず駆動トルクが抜�
 ## クイックスタート
 
 ```bash
-pip install -e .            # 依存: numpy / pandas / scipy / scikit-learn / optuna / seaborn / pyyaml
+pip install -e ".[parquet]"  # parquet を読むなら pyarrow が要る
+# 依存: numpy / pandas / scipy / scikit-learn / optuna / seaborn / pyyaml
 
 amtlab run --quick          # 小規模で一通り動かす(20 秒程度)
 amtlab run --config configs/default.yaml   # 本番設定(数分)
@@ -118,8 +119,8 @@ Optuna(NSGA-II, 150 試行)による適合最適化のベースライン比:
 | `amtlab dataset --samples 800` | ランダム DoE データセット生成のみ |
 | `amtlab analyze --dataset path.csv` | 既存データセットから解析のみ |
 | `amtlab calibrate --trials 200 --mode pareto` | 適合値の多目的最適化のみ |
-| `amtlab inspect --log log.csv` | ログの信号構成・サンプルレート診断(J1939 自動検出) |
-| `amtlab ingest --log log.csv` | 実車ログから変速イベントを切り出して KPI 化 |
+| `amtlab inspect --log logs/` | ログの信号構成・サンプルレート診断(複数ファイル可) |
+| `amtlab ingest --log logs/` | 実車ログから変速イベントを切り出して KPI 化(複数ファイル可) |
 | `amtlab demo-log --j1939` | J1939 形式のデモログ生成 |
 | `amtlab report --summary outputs/summary.json` | レポートだけ再生成(モデル差し替え検証に) |
 | `amtlab ollama` | Ollama の疎通確認 |
@@ -238,6 +239,71 @@ print(events[["current_gear", "to_gear", "shift_time_s",
 出力はシミュレーションと**同じ KPI スキーマ**なので、`amtlab analyze` 以降
 (代理モデル・カレントギア別集計・可視化)をそのまま適用できます。
 
+### 大量のログをまとめて確認する
+
+ディレクトリ / glob / 複数パスをそのまま渡せます(**parquet 対応**)。
+
+```bash
+amtlab inspect --log logs/                    # 全ファイルの信号構成を突き合わせ
+amtlab ingest  --log logs/ --out outputs      # 全ファイルの変速イベントを1つの表に
+amtlab ingest  --log "logs/2024-*/*.parquet" --jobs 8
+```
+
+parquet の列指向を活かして、**スキーマ(列名)だけ先に読んで、必要な信号の列だけ
+ロード**します。数百列あるログでも読むのは 15 列程度。時系列はファイルごとに
+捨ててKPI行だけ残すので、**メモリはファイル数ではなくイベント数にしか比例しません**。
+
+`inspect` はファイル間の差分だけを出します。
+
+```
+14 ファイル(読み込み可 13 / 失敗 1)
+
+全ファイルにある信号 (13): time, accel_pedal_pct, ... , gear_ratio
+どのファイルにも無い信号 (1): friction_torque_pct
+
+一部のファイルにしか無い信号:
+  clutch_slip_pct: 1 ファイルで欠落 (legacy_logger.parquet)
+  shift_in_process: 1 ファイルで欠落 (legacy_logger.parquet)
+  [読み込み失敗] broken.parquet: ArrowInvalid: Parquet magic bytes not found ...
+```
+
+`ingest` は 1 ファイルの失敗で止まらず、最後に注意点をまとめます。
+
+```
+13/14 ファイル読み込み成功 / 変速イベント 52 件
+  - 読み込みに失敗: 1 ファイル(broken.parquet — ArrowInvalid: ...)
+  - 変速イベントの切り出し方法がファイル間で混在しています
+    (gear_change, shift_in_process)。変速時間の定義が揃わないため比較には注意が必要です
+```
+
+**この警告が実務上いちばん効きます。** SPN 574 があるファイルと無いファイルが
+混ざると、前者は「トルクダウン開始から」、後者は「ギヤ抜きから」変速時間を測るので、
+**同じ土俵で比較できません**(本モデルで約 0.4 秒の系統差)。
+`detection_source` 列で層別するか、揃うファイルだけで比較してください。
+
+出力(`outputs/tables/`):
+
+| ファイル | 内容 |
+| --- | --- |
+| `log_events.csv` | 全ファイルの変速イベント KPI(`source_file` 付き) |
+| `log_files.csv` | ファイルごとの行数・時間・イベント数・エラー |
+| `signal_presence.csv` | ファイル × 信号の有無 |
+| `log_gear_summary.csv` | カレントギア別の集計(全ファイル横断) |
+
+Python からも同じことができます。
+
+```python
+from amtlab.batch import analyze_logs, signal_presence
+
+result = analyze_logs("logs/", n_jobs=8)
+print(result.summary())
+print(result.failures())          # 読めなかったファイルと理由
+print(result.events.groupby("source_file")["shift_time_s"].median())
+print(signal_presence("logs/"))   # データ本体は読まずに信号の有無だけ確認
+```
+
+時刻列は datetime / timedelta / 秒 / ミリ秒 のいずれでも自動で秒に揃えます。
+
 ### 手元にログが無いとき
 
 J1939 形式のデモログ(信号名・単位・PGN ごとの更新周期・分解能を模擬)を作れます。
@@ -300,6 +366,7 @@ CI や LLM 無し環境でもパイプラインは止まりません。
 | `amtlab.dataset` | 実験計画(DoE)とバッチ実行 |
 | `amtlab.features` | 変速品質 KPI の抽出・カレントギア別集計・目的関数 |
 | `amtlab.j1939` | J1939 信号の定義・自動検出・物理量変換・レート診断 |
+| `amtlab.batch` | 複数ログ(parquet/CSV)の一括読み込みと突き合わせ |
 | `amtlab.ingest` | 実車ログの取り込み・イベント切り出し |
 | `amtlab.modeling` | scikit-learn 代理モデル・感度解析 |
 | `amtlab.tuning` | Optuna によるハイパーパラメータ探索 |
@@ -314,7 +381,7 @@ CI や LLM 無し環境でもパイプラインは止まりません。
 
 ```bash
 pip install -e ".[dev]"
-pytest -q          # 130 tests / 1 分程度
+pytest -q          # 172 tests / 1.5 分程度
 ruff check src tests
 ```
 

@@ -21,7 +21,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+parquet = ["pyarrow>=14"]
+dev = ["pytest>=7.4", "pyarrow>=14"]
 
 [project.scripts]
 amtlab = "amtlab.cli:main"

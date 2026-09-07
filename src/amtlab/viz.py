@@ -436,3 +436,52 @@ def plot_speed_time_relation(df: pd.DataFrame, outdir: Path | str,
     g.set_axis_labels("shift time [s]", "km/h")
     g.figure.suptitle("Shift time vs speed drop / shift loss", y=1.03)
     return _save(g.figure, outdir, name)
+
+
+def plot_file_comparison(events: pd.DataFrame, outdir: Path | str,
+                         name: str = "file_comparison", max_files: int = 40) -> Path:
+    """ログファイル(走行)ごとの KPI ばらつきを比較する。
+
+    ファイル数が多い場合は中央値の順に並べ、上位/下位が見えるようにする。
+    """
+    set_style()
+    kpis = [c for c in ("shift_time_s", "speed_drop_kmh", "speed_loss_kmh",
+                        "torque_interrupt_s") if c in events.columns]
+    d = events.copy()
+    d["file"] = d["source_file"].astype(str)
+    order = d.groupby("file")[kpis[0]].median().sort_values().index.tolist()
+    if len(order) > max_files:  # 端(良い方/悪い方)を残して間引く
+        keep = order[: max_files // 2] + order[-max_files // 2:]
+        d = d[d["file"].isin(keep)]
+        order = [f for f in order if f in set(keep)]
+    long = d.melt(id_vars=["file"], value_vars=kpis, var_name="kpi", value_name="value")
+    g = sns.catplot(
+        data=long, x="value", y="file", col="kpi", kind="box", order=order,
+        col_wrap=2, height=max(3.0, 0.22 * len(order)), aspect=1.5,
+        sharex=False, showfliers=False, width=0.7,
+    )
+    g.set_titles("{col_name}")
+    g.set_axis_labels("", "")
+    for ax in g.axes.flat:
+        ax.tick_params(axis="y", labelsize=7)
+    g.figure.suptitle(f"KPI by log file ({len(order)} files)", y=1.01)
+    return _save(g.figure, outdir, name)
+
+
+def plot_signal_presence(presence: pd.DataFrame, outdir: Path | str,
+                         name: str = "signal_presence") -> Path:
+    """ファイル × 信号の有無マトリクス(どのログに何が入っているか)。"""
+    set_style()
+    d = presence.set_index("file")
+    cols = [c for c in d.columns if d[c].dtype == bool]
+    matrix = d[cols].astype(int)
+    fig, ax = plt.subplots(
+        figsize=(max(7.0, 0.42 * len(cols)), max(3.0, 0.28 * len(matrix)))
+    )
+    sns.heatmap(matrix, cmap=["#f4c7c3", "#b7e1cd"], cbar=False, linewidths=0.5,
+                linecolor="white", ax=ax, vmin=0, vmax=1)
+    ax.set_title("Signal availability per log file (green = present)")
+    ax.set_ylabel("")
+    ax.tick_params(axis="x", labelrotation=90, labelsize=8)
+    ax.tick_params(axis="y", labelsize=7)
+    return _save(fig, outdir, name)

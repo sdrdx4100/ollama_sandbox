@@ -122,6 +122,27 @@ def split_prefix(name: str) -> tuple[str, str]:
     return "", text
 
 
+def to_seconds(series: pd.Series) -> pd.Series:
+    """時刻列を「先頭からの秒」に変換する。
+
+    実ログの時刻は datetime / timedelta / 秒 / ミリ秒 とまちまちなので吸収する。
+    """
+
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return (series - series.iloc[0]).dt.total_seconds()
+    if pd.api.types.is_timedelta64_dtype(series):
+        return series.dt.total_seconds()
+    values = pd.to_numeric(series, errors="coerce")
+    if values.notna().sum() < 2:
+        return values
+    span = float(values.max() - values.min())
+    step = float(values.diff().median())
+    # ms / us で入っている場合の単位推定(1 サンプルが 1 秒以上になることは無い)
+    if step >= 1000.0 or (span > 1e6 and step >= 1.0):
+        return values / 1000.0
+    return values
+
+
 def _normalize(name: str) -> str:
     """列名を突き合わせ用に正規化する。
 
@@ -448,7 +469,10 @@ def decode(df: pd.DataFrame, mapping: dict[str, str] | None = None) -> pd.DataFr
 
     out = pd.DataFrame()
     for key, column in mapping.items():
-        out[key] = pd.to_numeric(df[column], errors="coerce")
+        out[key] = (
+            to_seconds(df[column]) if key == "time"
+            else pd.to_numeric(df[column], errors="coerce")
+        )
     out = out.sort_values("time").reset_index(drop=True)
     out["time"] = out["time"] - out["time"].iloc[0]
 

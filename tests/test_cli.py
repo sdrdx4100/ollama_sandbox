@@ -49,6 +49,30 @@ def test_j1939_demo_log_inspect_and_ingest(tmp_path, capsys):
     assert (kpi["detection_source"] == "shift_in_process").all()
 
 
+def test_batch_ingest_over_a_directory(tmp_path, capsys):
+    pytest.importorskip("pyarrow")
+    from amtlab.ingest import make_j1939_demo_log
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    for i in range(3):
+        make_j1939_demo_log(n_shifts=3, seed=20 + i).to_parquet(
+            logs / f"drive_{i}.parquet", index=False
+        )
+
+    assert main(["inspect", "--log", str(logs), "--save", str(tmp_path / "ch.csv")]) == 0
+    assert (tmp_path / "ch_presence.csv").exists()
+    assert "全ファイルにある信号" in capsys.readouterr().out
+
+    out = tmp_path / "batch"
+    assert main(["ingest", "--log", str(logs), "--out", str(out), "--jobs", "1"]) == 0
+    events = pd.read_csv(out / "tables" / "log_events.csv")
+    assert events["source_file"].nunique() == 3
+    assert (out / "tables" / "log_files.csv").exists()
+    assert (out / "tables" / "signal_presence.csv").exists()
+    assert (out / "figures" / "file_comparison.png").exists()
+
+
 def test_report_command_uses_fallback(tmp_path):
     summary = {
         "dataset": {"n_events": 1, "upshift_ratio": 1.0, "speed_range_kmh": [10, 20],

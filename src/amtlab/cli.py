@@ -143,47 +143,137 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 def cmd_ingest(args: argparse.Namespace) -> int:
     from . import viz
-    from .ingest import SignalMap, analyze_log
+    from .batch import analyze_logs, iter_log_paths, signal_presence
+    from .features import gear_summary
+    from .ingest import analyze_log
 
-    if args.map:
-        sm = SignalMap.from_file(args.map)
-        sm.auto_detect = not args.no_auto
-    else:
-        sm = SignalMap(
-            time=args.col_time,
-            engine_speed_rpm=args.col_engine_speed,
-            speed_kmh=args.col_speed,
-            gear=args.col_gear,
-            throttle=args.col_throttle,
-            shaft_torque=args.col_torque,
-            auto_detect=not args.no_auto,
-        )
-    trace, kpi = analyze_log(args.log, sm, resample_hz=args.resample_hz)
-    print(f"検出: {len(trace.attrs.get('mapping', {}))} 信号 / "
-          f"加速度の出所: {trace.attrs.get('accel_source')} "
-          f"(jerk 信頼度: {trace.attrs.get('jerk_quality')})")
+    sm = _signal_map_from_args(args)
+    paths = iter_log_paths(args.log)
+    if not paths:
+        print(f"ログが見つかりません: {args.log}")
+        return 1
+
     out = Path(args.out)
     (out / "tables").mkdir(parents=True, exist_ok=True)
-    kpi.to_csv(out / "tables" / "log_events.csv", index=False)
-    if kpi.empty:
-        print("変速イベントを検出できませんでした(ギヤ信号を確認してください)")
+
+    # --- 単一ファイル: 従来どおり時系列も描く ----------------------------
+    if len(paths) == 1:
+        trace, kpi = analyze_log(paths[0], sm, resample_hz=args.resample_hz)
+        kpi.to_csv(out / "tables" / "log_events.csv", index=False)
+        if kpi.empty:
+            print("変速イベントを検出できませんでした(ギヤ信号を確認してください)")
+            return 1
+        print(f"検出: {len(trace.attrs.get('mapping', {}))} 信号 / "
+              f"加速度の出所: {trace.attrs.get('accel_source')} "
+              f"(jerk 信頼度: {trace.attrs.get('jerk_quality')})")
+        print(kpi.round(3).to_string(index=False))
+        print(f"figure: {viz.plot_log_overview(trace, kpi, out / 'figures')}")
+        figure = viz.plot_kpi_distributions(
+            kpi, out / "figures", "log_kpi_distributions"
+        )
+        print(f"figure: {figure}")
+        return 0
+
+    # --- 複数ファイル: KPI 表に畳んで比較 --------------------------------
+    result = analyze_logs(
+        paths, sm, resample_hz=args.resample_hz, n_jobs=args.jobs
+    )
+    result.files.to_csv(out / "tables" / "log_files.csv", index=False)
+    print(result.summary())
+    if result.events.empty:
+        print("\n変速イベントを検出できませんでした")
         return 1
-    print(kpi.round(3).to_string(index=False))
-    print(f"figure: {viz.plot_log_overview(trace, kpi, out / 'figures')}")
-    print(f"figure: {viz.plot_kpi_distributions(kpi, out / 'figures', 'log_kpi_distributions')}")
+
+    result.events.to_csv(out / "tables" / "log_events.csv", index=False)
+    gears = gear_summary(result.events)
+    gears.to_csv(out / "tables" / "log_gear_summary.csv", index=False)
+    presence = signal_presence(paths, sm)
+    presence.to_csv(out / "tables" / "signal_presence.csv", index=False)
+
+    print("\nカレントギア別:")
+    columns = [c for c in ("current_gear", "direction", "shift_time_s_count",
+                           "shift_time_s_mean", "speed_drop_kmh_mean",
+                           "speed_loss_kmh_mean") if c in gears.columns]
+    print(gears[columns].to_string(index=False))
+
+    figures = [
+        viz.plot_gear_analysis(result.events, out / "figures", "log_gear_analysis"),
+        viz.plot_file_comparison(result.events, out / "figures"),
+        viz.plot_signal_presence(presence, out / "figures"),
+        viz.plot_kpi_distributions(result.events, out / "figures",
+                                   "log_kpi_distributions"),
+    ]
+    for path in figures:
+        print(f"figure: {path}")
     return 0
 
 
+def _signal_map_from_args(args: argparse.Namespace):
+    from .ingest import SignalMap
+
+    if getattr(args, "map", None):
+        sm = SignalMap.from_file(args.map)
+        sm.auto_detect = not getattr(args, "no_auto", False)
+        return sm
+    return SignalMap(
+        time=args.col_time,
+        engine_speed_rpm=args.col_engine_speed,
+        speed_kmh=args.col_speed,
+        gear=args.col_gear,
+        throttle=args.col_throttle,
+        shaft_torque=args.col_torque,
+        auto_detect=not args.no_auto,
+    )
+
+
 def cmd_inspect(args: argparse.Namespace) -> int:
-    """ログの信号構成とサンプルレートを診断する。"""
+    """ログの信号構成とサンプルレートを診断する(複数ファイル可)。"""
+    from .batch import iter_log_paths, read_log, signal_presence
+    from .ingest import SignalMap
     from .j1939 import format_report, inspect_log
 
-    df = pd.read_csv(args.log)
-    mapping = None
-    if args.map:
-        from .ingest import SignalMap
+    paths = iter_log_paths(args.log)
+    if not paths:
+        print(f"ログが見つかりません: {args.log}")
+        return 1
 
-        mapping = SignalMap.from_file(args.map).resolve(df)
+    if len(paths) > 1:
+        presence = signal_presence(paths, _signal_map_from_args(args)
+                                   if args.map else SignalMap())
+        flags = [c for c in presence.columns if presence[c].dtype == bool]
+        broken = presence[presence["error"] != ""]
+        ok = presence[presence["error"] == ""]
+        print(f"{len(paths)} ファイル(読み込み可 {len(ok)} / 失敗 {len(broken)})")
+
+        everywhere = [c for c in flags if len(ok) and ok[c].all()]
+        partial = [c for c in flags if len(ok) and not ok[c].all() and ok[c].any()]
+        nowhere = [c for c in flags if len(ok) and not ok[c].any()]
+        print(f"\n全ファイルにある信号 ({len(everywhere)}): " + ", ".join(everywhere))
+        if nowhere:
+            print(f"どのファイルにも無い信号 ({len(nowhere)}): " + ", ".join(nowhere))
+        if partial:
+            print("\n一部のファイルにしか無い信号:")
+            for column in partial:
+                missing = ok.loc[~ok[column], "file"].tolist()
+                shown = ", ".join(missing[:5]) + (" ..." if len(missing) > 5 else "")
+                print(f"  {column}: {len(missing)} ファイルで欠落 ({shown})")
+        for _, row in broken.iterrows():
+            print(f"  [読み込み失敗] {row['file']}: {row['error']}")
+        if args.save:
+            presence_path = Path(args.save).with_name(
+                Path(args.save).stem + "_presence.csv"
+            )
+            presence.to_csv(presence_path, index=False)
+            print(f"\n-> {presence_path}")
+
+        readable = [p for p in paths if p.name in set(ok["file"])]
+        if not readable:
+            return 1
+        paths = readable[:1]
+        print(f"\n代表 1 ファイル ({paths[0].name}) の詳細:")
+
+    df = read_log(paths[0])
+    mapping = SignalMap.from_file(args.map).resolve(df) if args.map else None
     report = inspect_log(df, mapping)
     print(format_report(report))
     if args.save:
@@ -280,7 +370,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_rep.set_defaults(func=cmd_report)
 
     p_in = sub.add_parser("ingest", help="実車ログから変速イベントを切り出して解析")
-    p_in.add_argument("--log", required=True, help="ログ CSV のパス")
+    p_in.add_argument("--log", required=True, nargs="+",
+                      help="ログのパス / ディレクトリ / glob(複数可、parquet 対応)")
+    p_in.add_argument("--jobs", type=int, default=-1, help="並列数(複数ファイル時)")
     p_in.add_argument("--out", default="outputs")
     p_in.add_argument("--resample-hz", type=float, default=100.0)
     p_in.add_argument("--col-time", default="time")
@@ -304,8 +396,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_dl.set_defaults(func=cmd_demo_log)
 
     p_ins = sub.add_parser("inspect", help="ログの信号構成とサンプルレートを診断")
-    p_ins.add_argument("--log", required=True)
-    p_ins.add_argument("--save", default=None, help="診断結果の CSV 出力先")
+    p_ins.add_argument("--log", required=True, nargs="+",
+                       help="ログのパス / ディレクトリ / glob(複数可)")
+    p_ins.add_argument("--save", default=None,
+                       help="チャネル診断の CSV 出力先(複数ファイル時は "
+                            "<stem>_presence.csv に信号の有無表も出力)")
     p_ins.add_argument("--map", default=None,
                        help="{内部名: 列名} の YAML/JSON で自動検出を上書き")
     p_ins.set_defaults(func=cmd_inspect)
