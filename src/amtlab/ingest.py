@@ -66,6 +66,23 @@ class SignalMap:
     #: 指定が無い信号を J1939 の別名から自動検出するか
     auto_detect: bool = True
 
+    @staticmethod
+    def from_file(path: str | Path) -> "SignalMap":
+        """``{内部名: 列名}`` の YAML / JSON から作る(部分指定で可)。
+
+        自動検出が外れた信号だけを書けばよい。残りは自動検出に任せる。
+        """
+        import yaml
+
+        data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+        known = {f.name for f in fields(SignalMap)}
+        unknown = set(data) - known
+        if unknown:
+            raise KeyError(
+                f"SignalMap に無いキー: {sorted(unknown)} / 使えるキー: {sorted(known)}"
+            )
+        return SignalMap(**data)
+
     def required(self) -> list[str]:
         return ["time", "engine_speed_rpm", "speed_kmh"]
 
@@ -622,20 +639,20 @@ def make_demo_log(
 #: J1939 デモログの列名(SPN 名に寄せた、よくあるロガー出力の形)
 J1939_DEMO_COLUMNS = {
     "time": "Timestamp",
-    "accel_pedal_pct": "EEC2_AcceleratorPedalPosition1",
-    "demand_torque_pct": "EEC1_DriversDemandEnginePercentTorque",
-    "actual_torque_pct": "EEC1_ActualEnginePercentTorque",
-    "reference_torque_nm": "EC1_EngineReferenceTorque",
-    "engine_speed_rpm": "EEC1_EngineSpeed",
-    "speed_kmh": "CCVS1_WheelBasedVehicleSpeed",
-    "front_axle_speed_kmh": "EBC2_FrontAxleSpeed",
-    "input_shaft_rpm": "ETC1_TransmissionInputShaftSpeed",
-    "output_shaft_rpm": "ETC1_TransmissionOutputShaftSpeed",
-    "clutch_slip_pct": "ETC1_PercentClutchSlip",
-    "shift_in_process": "ETC1_TransmissionShiftInProcess",
-    "gear": "ETC2_TransmissionCurrentGear",
-    "selected_gear": "ETC2_TransmissionSelectedGear",
-    "gear_ratio": "ETC2_TransmissionActualGearRatio",
+    "accel_pedal_pct": "EEC2::AcceleratorPedalPosition1",
+    "demand_torque_pct": "EEC1::DriversDemandEnginePercentTorque",
+    "actual_torque_pct": "EEC1::ActualEnginePercentTorque",
+    "reference_torque_nm": "EC1::EngineReferenceTorque",
+    "engine_speed_rpm": "EEC1::EngineSpeed",
+    "speed_kmh": "CCVS1::WheelBasedVehicleSpeed",
+    "front_axle_speed_kmh": "EBC2::FrontAxleSpeed",
+    "input_shaft_rpm": "ETC1::TransmissionInputShaftSpeed",
+    "output_shaft_rpm": "ETC1::TransmissionOutputShaftSpeed",
+    "clutch_slip_pct": "ETC1::PercentClutchSlip",
+    "shift_in_process": "ETC1::TransmissionShiftInProcess",
+    "gear": "ETC2::TransmissionCurrentGear",
+    "selected_gear": "ETC2::TransmissionSelectedGear",
+    "gear_ratio": "ETC2::TransmissionActualGearRatio",
 }
 
 #: 各信号の代表的な更新周期 [Hz](PGN ごとに違う)

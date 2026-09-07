@@ -13,10 +13,12 @@ from amtlab.ingest import (
 from amtlab.j1939 import (
     CATALOG_BY_KEY,
     J1939_CATALOG,
+    _normalize,
     decode,
     detect_columns,
     format_report,
     inspect_log,
+    split_prefix,
 )
 
 
@@ -37,6 +39,96 @@ def test_detects_every_demo_signal(j1939_log):
     mapping = detect_columns(j1939_log)
     for key, column in J1939_DEMO_COLUMNS.items():
         assert mapping.get(key) == column, key
+
+
+# --- 列名の正規化(UpperCamelCase + メッセージ名プレフィックス) ------------------
+@pytest.mark.parametrize(
+    "column,prefix,body",
+    [
+        ("EEC1::EngineSpeed", "EEC1", "EngineSpeed"),
+        ("ETC2::TransmissionCurrentGear", "ETC2", "TransmissionCurrentGear"),
+        ("EEC1.ActualEnginePercentTorque", "EEC1", "ActualEnginePercentTorque"),
+        ("EEC1_EngineSpeed", "EEC1", "EngineSpeed"),
+        ("CCVS1/WheelBasedVehicleSpeed", "CCVS1", "WheelBasedVehicleSpeed"),
+        ("engine_speed_rpm", "", "engine_speed_rpm"),  # 小文字は割らない
+        ("speed_kmh", "", "speed_kmh"),
+        ("EngineSpeed", "", "EngineSpeed"),
+    ],
+)
+def test_prefix_is_split_only_when_it_looks_like_a_message_name(column, prefix, body):
+    assert split_prefix(column) == (prefix, body)
+
+
+@pytest.mark.parametrize(
+    "raw,normalized",
+    [
+        ("TransmissionCurrentGear", "transmission_current_gear"),
+        ("AcceleratorPedalPosition1", "accelerator_pedal_position_1"),
+        ("WheelBasedVehicleSpeed", "wheel_based_vehicle_speed"),
+        ("PercentClutchSlip", "percent_clutch_slip"),
+        ("engine_speed_rpm", "engine_speed_rpm"),
+    ],
+)
+def test_camel_case_is_split_into_words(raw, normalized):
+    assert _normalize(raw) == normalized
+
+
+def test_upper_camel_case_with_prefix_is_detected():
+    columns = [
+        "Timestamp",
+        "EEC1::EngineSpeed",
+        "CCVS1::WheelBasedVehicleSpeed",
+        "ETC1::TransmissionShiftInProcess",
+        "ETC2::TransmissionCurrentGear",
+        "ETC2::TransmissionSelectedGear",
+        "ETC2::TransmissionActualGearRatio",
+        "ETC1::PercentClutchSlip",
+        "ETC1::TransmissionInputShaftSpeed",
+        "ETC1::TransmissionOutputShaftSpeed",
+        "EEC2::AcceleratorPedalPosition1",
+        "EEC1::ActualEnginePercentTorque",
+        "EEC1::DriversDemandEnginePercentTorque",
+        "EC1::EngineReferenceTorque",
+        "EBC2::FrontAxleSpeed",
+    ]
+    mapping = detect_columns(pd.DataFrame(columns=columns))
+    assert mapping["engine_speed_rpm"] == "EEC1::EngineSpeed"
+    assert mapping["shift_in_process"] == "ETC1::TransmissionShiftInProcess"
+    assert mapping["gear"] == "ETC2::TransmissionCurrentGear"
+    assert mapping["selected_gear"] == "ETC2::TransmissionSelectedGear"
+    assert mapping["gear_ratio"] == "ETC2::TransmissionActualGearRatio"
+    assert len(mapping) == len(columns)  # 全列が別々の信号に割り当たる
+
+
+def test_specific_alias_beats_a_similar_signal():
+    """SPN 512(Driver's Demand)と SPN 2432(Engine Demand)を取り違えない。"""
+    columns = [
+        "Timestamp",
+        "EEC1::EngineSpeed",
+        "CCVS1::WheelBasedVehicleSpeed",
+        "EEC1::DriversDemandEnginePercentTorque",
+        "EEC1::EngineDemandPercentTorque",
+    ]
+    mapping = detect_columns(pd.DataFrame(columns=columns))
+    assert mapping["demand_torque_pct"] == "EEC1::DriversDemandEnginePercentTorque"
+    assert "EEC1::EngineDemandPercentTorque" not in mapping.values()
+
+
+def test_each_column_is_used_by_at_most_one_signal():
+    columns = ["Timestamp", "EEC1::EngineSpeed", "CCVS1::WheelBasedVehicleSpeed",
+               "ETC2::TransmissionCurrentGear", "ETC2::TransmissionActualGearRatio"]
+    mapping = detect_columns(pd.DataFrame(columns=columns))
+    assert len(set(mapping.values())) == len(mapping)
+
+
+def test_unrelated_columns_stay_unmapped():
+    columns = ["Timestamp", "EEC1::EngineSpeed", "CCVS1::WheelBasedVehicleSpeed",
+               "ETC2::TransmissionCurrentGear", "CCVS1::ParkingBrakeSwitch",
+               "ETC1::TransmissionDrivelineEngaged", "AMB::AmbientAirTemperature"]
+    mapping = detect_columns(pd.DataFrame(columns=columns))
+    for noise in ("CCVS1::ParkingBrakeSwitch", "ETC1::TransmissionDrivelineEngaged",
+                  "AMB::AmbientAirTemperature"):
+        assert noise not in mapping.values()
 
 
 @pytest.mark.parametrize(
@@ -182,9 +274,9 @@ def test_driveline_speed_is_kept_but_not_used_for_accel(j1939_log):
 
 # --- 明示指定と自動検出の併用 ------------------------------------------------------
 def test_explicit_columns_win_over_auto_detection(j1939_log):
-    sm = SignalMap(speed_kmh="EBC2_FrontAxleSpeed")
+    sm = SignalMap(speed_kmh="EBC2::FrontAxleSpeed")
     mapping = sm.resolve(j1939_log)
-    assert mapping["speed_kmh"] == "EBC2_FrontAxleSpeed"
+    assert mapping["speed_kmh"] == "EBC2::FrontAxleSpeed"
 
 
 def test_auto_detection_can_be_disabled(j1939_log):
@@ -197,6 +289,30 @@ def test_missing_signals_raise_with_a_helpful_message():
     df = pd.DataFrame({"time": [0.0, 0.1], "ETC2_TransmissionCurrentGear": [1, 1]})
     with pytest.raises(KeyError, match="engine_speed_rpm"):
         SignalMap().resolve(df)
+
+
+def test_report_lists_unmapped_columns(j1939_log):
+    log = j1939_log.copy()
+    log["CCVS1::ParkingBrakeSwitch"] = 0
+    report = inspect_log(log)
+    assert "CCVS1::ParkingBrakeSwitch" in report.unmapped_columns
+    assert "マッピングされなかった列" in format_report(report)
+
+
+def test_signal_map_file_overrides_auto_detection(j1939_log, tmp_path):
+    path = tmp_path / "map.yaml"
+    path.write_text("speed_kmh: 'EBC2::FrontAxleSpeed'\n", encoding="utf-8")
+    sm = SignalMap.from_file(path)
+    mapping = sm.resolve(j1939_log)
+    assert mapping["speed_kmh"] == "EBC2::FrontAxleSpeed"
+    assert mapping["engine_speed_rpm"] == "EEC1::EngineSpeed"  # 残りは自動検出
+
+
+def test_signal_map_file_rejects_unknown_keys(tmp_path):
+    path = tmp_path / "map.yaml"
+    path.write_text("nonexistent_signal: X\n", encoding="utf-8")
+    with pytest.raises(KeyError):
+        SignalMap.from_file(path)
 
 
 def test_unknown_keys_do_not_break_the_report(j1939_log):

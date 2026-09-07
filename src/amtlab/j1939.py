@@ -50,22 +50,92 @@ class J1939Signal:
     name_en: str
     name_ja: str
     unit: str
-    aliases: tuple[str, ...]  # 正規表現(小文字化した列名に対して検索)
+    #: 正規表現(正規化した列名に対して検索)。**特異度の高い順に並べる**
+    #: — 先に書いたパターンほど高いスコアになる。
+    #: 例: ``driver.*demand.*torque``(SPN 512)を ``demand.*torque``(SPN 2432
+    #: の Engine Demand なども拾う)より前に置くことで取り違えを防ぐ。
+    aliases: tuple[str, ...]
     typical_rate_hz: float | None = None
     discrete: bool = False  # 離散信号(ギヤ位置・状態フラグ)は更新周期を推定しない
 
+    def score(self, column: str) -> float:
+        """列名との一致度。0 なら不一致、大きいほど確からしい。
+
+        ``EEC1::EngineSpeed`` のような「メッセージ名 + UpperCamelCase」を
+        想定し、プレフィックスを外した本体と、外さない全体の両方で照合する
+        (外して失敗するくらいなら外さない方を採る)。プレフィックスが
+        その SPN の PGN と一致していればボーナスを付ける。
+        """
+
+        prefix, body = split_prefix(column)
+        body_norm = _normalize(body)
+        full_norm = _normalize(column)
+        score = 0.0
+
+        if self.spn is not None:
+            pattern = rf"(^|[^0-9]){self.spn}([^0-9]|$)"
+            if re.search(pattern, body_norm) or re.search(pattern, full_norm):
+                score += 3.0  # SPN 番号が入っていれば最も確か
+
+        # 別名は特異度順。先頭に近いパターンほど高スコア
+        for i, alias in enumerate(self.aliases):
+            penalty = 0.1 * i
+            if re.search(alias, body_norm):
+                score += 2.0 - penalty
+                break
+            if re.search(alias, full_norm):
+                score += 1.5 - penalty
+                break
+
+        if score and prefix and prefix.upper() == self.pgn.upper():
+            score += 1.0  # メッセージ名が期待する PGN と一致
+        return score
+
     def matches(self, column: str) -> bool:
-        norm = _normalize(column)
-        if self.spn is not None and re.search(rf"(^|[^0-9]){self.spn}([^0-9]|$)", norm):
-            return True
-        return any(re.search(pattern, norm) for pattern in self.aliases)
+        return self.score(column) > 0
+
+
+#: メッセージ名(PGN の略称)らしいプレフィックス: 大文字 + 数字のみ
+_PREFIX_TOKEN = re.compile(r"^[A-Z][A-Z0-9]{1,9}$")
+#: 名前空間の区切り
+_PREFIX_SPLIT = re.compile(r"^(.*?)\s*(?:::|:|\.|__|/|\|)\s*(.+)$")
+
+
+def split_prefix(name: str) -> tuple[str, str]:
+    """``EEC1::EngineSpeed`` → ``("EEC1", "EngineSpeed")``。
+
+    区切り記号(``::`` ``:`` ``.`` ``/`` ``__``)があればそこで分ける。
+    区切りが ``_`` 一つだけの場合は、前半が ``EEC1`` のような
+    「大文字 + 数字」のときに限りプレフィックスとみなす
+    (``engine_speed`` を ``engine`` + ``speed`` に割らないため)。
+    """
+
+    text = str(name).strip()
+    matched = _PREFIX_SPLIT.match(text)
+    if matched:
+        prefix, body = matched.group(1).strip(), matched.group(2).strip()
+        if prefix:
+            return prefix, body
+    head, _, tail = text.partition("_")
+    if tail and _PREFIX_TOKEN.match(head):
+        return head, tail
+    return "", text
 
 
 def _normalize(name: str) -> str:
-    """列名を突き合わせ用に正規化する(小文字化・記号を _ に統一)。"""
-    text = str(name).strip().lower()
-    text = re.sub(r"[\s\-\./\[\]\(\)（）:：]+", "_", text)
-    return re.sub(r"_+", "_", text)
+    """列名を突き合わせ用に正規化する。
+
+    UpperCamelCase を単語に割ってから小文字化し、記号を ``_`` に統一する。
+    ``TransmissionCurrentGear`` → ``transmission_current_gear``
+    """
+
+    text = str(name).strip()
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", text)  # aB   -> a_B
+    text = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", text)  # ABc  -> A_Bc
+    text = re.sub(r"(?<=[A-Za-z])(?=[0-9])", "_", text)  # a1   -> a_1
+    text = text.lower()
+    text = re.sub(r"[\s\-\./\[\]\(\)（）:：|]+", "_", text)
+    return re.sub(r"_+", "_", text).strip("_")
 
 
 #: 対応 SPN のカタログ
@@ -159,17 +229,39 @@ CATALOG_BY_KEY: dict[str, J1939Signal] = {s.key: s for s in J1939_CATALOG}
 MINIMUM_KEYS = ("time", "engine_speed_rpm", "speed_kmh")
 
 
+def score_columns(df: pd.DataFrame) -> dict[str, list[tuple[float, str]]]:
+    """信号ごとの候補列を、一致度の高い順に返す。"""
+    scored: dict[str, list[tuple[float, str]]] = {}
+    for signal in J1939_CATALOG:
+        candidates = [(signal.score(c), str(c)) for c in df.columns]
+        candidates = [(sc, c) for sc, c in candidates if sc > 0]
+        if candidates:
+            # 同点なら短い(修飾の少ない)列名を優先
+            candidates.sort(key=lambda t: (-t[0], len(t[1]), t[1]))
+            scored[signal.key] = candidates
+    return scored
+
+
 def detect_columns(df: pd.DataFrame) -> dict[str, str]:
     """DataFrame の列名から SPN を自動検出して {内部名: 列名} を返す。
 
-    複数列が同じ SPN に該当した場合は、より短い(修飾の少ない)列名を採用する。
+    ``EEC1::EngineSpeed`` のようなメッセージ名プレフィックスと
+    UpperCamelCase に対応する。1 つの列が複数の信号の候補になった場合は、
+    一致度の高い方に割り当て、負けた側は次点の候補に回す(貪欲マッチング)。
     """
 
+    scored = score_columns(df)
+    triples = sorted(
+        ((sc, key, col) for key, cands in scored.items() for sc, col in cands),
+        key=lambda t: (-t[0], len(t[2]), t[1], t[2]),
+    )
     found: dict[str, str] = {}
-    for signal in J1939_CATALOG:
-        candidates = [c for c in df.columns if signal.matches(c)]
-        if candidates:
-            found[signal.key] = min(candidates, key=lambda c: (len(str(c)), str(c)))
+    used: set[str] = set()
+    for _, key, column in triples:
+        if key in found or column in used:
+            continue
+        found[key] = column
+        used.add(column)
     return found
 
 
@@ -195,6 +287,8 @@ class LogReport:
     channels: list[ChannelReport] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    ambiguous: list[str] = field(default_factory=list)
+    unmapped_columns: list[str] = field(default_factory=list)
     duration_s: float = 0.0
     n_rows: int = 0
     log_rate_hz: float = 0.0
@@ -247,8 +341,17 @@ def _effective_rate(time: np.ndarray, values: np.ndarray) -> float:
 def inspect_log(df: pd.DataFrame, mapping: dict[str, str] | None = None) -> LogReport:
     """ログの内容を診断する(検出チャネル・サンプルレート・注意点)。"""
 
+    auto = mapping is None
     mapping = mapping or detect_columns(df)
     report = LogReport(n_rows=len(df))
+    report.unmapped_columns = [str(c) for c in df.columns if str(c) not in set(mapping.values())]
+    if auto:
+        for key, candidates in score_columns(df).items():
+            others = [c for _, c in candidates if c != mapping.get(key)]
+            if others and len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+                report.ambiguous.append(
+                    f"{key}: {mapping.get(key)} を採用(同点の候補: {', '.join(others[:3])})"
+                )
 
     if "time" not in mapping:
         report.warnings.append("時刻列を検出できませんでした")
@@ -397,7 +500,16 @@ def format_report(report: LogReport) -> str:
             f"{spn:>5}  {ch.key:<22}{ch.column:<34}{rate:>7}  {ch.name_ja}{note}"
         )
     if report.missing:
-        lines += ["", "未検出: " + ", ".join(report.missing)]
+        lines += ["", "未検出の SPN: " + ", ".join(report.missing)]
+    if report.unmapped_columns:
+        shown = report.unmapped_columns[:20]
+        more = len(report.unmapped_columns) - len(shown)
+        lines += ["", f"マッピングされなかった列 ({len(report.unmapped_columns)}):"]
+        lines += [f"  {c}" for c in shown]
+        if more:
+            lines.append(f"  ... 他 {more} 列")
+    if report.ambiguous:
+        lines += ["", "候補が複数あった信号:"] + [f"  - {a}" for a in report.ambiguous]
     if report.warnings:
         lines += ["", "注意:"] + [f"  - {w}" for w in report.warnings]
     return "\n".join(lines)

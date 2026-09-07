@@ -145,15 +145,19 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     from . import viz
     from .ingest import SignalMap, analyze_log
 
-    sm = SignalMap(
-        time=args.col_time,
-        engine_speed_rpm=args.col_engine_speed,
-        speed_kmh=args.col_speed,
-        gear=args.col_gear,
-        throttle=args.col_throttle,
-        shaft_torque=args.col_torque,
-        auto_detect=not args.no_auto,
-    )
+    if args.map:
+        sm = SignalMap.from_file(args.map)
+        sm.auto_detect = not args.no_auto
+    else:
+        sm = SignalMap(
+            time=args.col_time,
+            engine_speed_rpm=args.col_engine_speed,
+            speed_kmh=args.col_speed,
+            gear=args.col_gear,
+            throttle=args.col_throttle,
+            shaft_torque=args.col_torque,
+            auto_detect=not args.no_auto,
+        )
     trace, kpi = analyze_log(args.log, sm, resample_hz=args.resample_hz)
     print(f"検出: {len(trace.attrs.get('mapping', {}))} 信号 / "
           f"加速度の出所: {trace.attrs.get('accel_source')} "
@@ -175,7 +179,12 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     from .j1939 import format_report, inspect_log
 
     df = pd.read_csv(args.log)
-    report = inspect_log(df)
+    mapping = None
+    if args.map:
+        from .ingest import SignalMap
+
+        mapping = SignalMap.from_file(args.map).resolve(df)
+    report = inspect_log(df, mapping)
     print(format_report(report))
     if args.save:
         report.to_frame().to_csv(args.save, index=False)
@@ -280,6 +289,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_in.add_argument("--col-gear", default="gear")
     p_in.add_argument("--col-throttle", default="throttle")
     p_in.add_argument("--col-torque", default="shaft_torque")
+    p_in.add_argument("--map", default=None,
+                      help="{内部名: 列名} の YAML/JSON で自動検出を上書き")
     p_in.add_argument("--no-auto", action="store_true",
                       help="J1939 の列名自動検出を無効にする")
     p_in.set_defaults(func=cmd_ingest)
@@ -295,6 +306,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ins = sub.add_parser("inspect", help="ログの信号構成とサンプルレートを診断")
     p_ins.add_argument("--log", required=True)
     p_ins.add_argument("--save", default=None, help="診断結果の CSV 出力先")
+    p_ins.add_argument("--map", default=None,
+                       help="{内部名: 列名} の YAML/JSON で自動検出を上書き")
     p_ins.set_defaults(func=cmd_inspect)
 
     p_ol = sub.add_parser("ollama", help="Ollama の接続確認")

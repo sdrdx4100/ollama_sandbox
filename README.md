@@ -138,13 +138,38 @@ amtlab ingest  --log mylog.csv    # 変速イベントを切り出して KPI 化
 
 ```
   SPN  内部名                   列名                                   実効Hz  信号
-   84  speed_kmh             CCVS1_WheelBasedVehicleSpeed         10.0  ホイールベース車速
-  190  engine_speed_rpm      EEC1_EngineSpeed                     50.0  エンジン回転数
-  191  output_shaft_rpm      ETC1_TransmissionOutputShaftSpeed    50.0  アウトプットシャフト回転数
-  522  clutch_slip_pct       ETC1_PercentClutchSlip               50.0  クラッチ滑り率
-  523  gear                  ETC2_TransmissionCurrentGear           離散  現在のギア位置
-  574  shift_in_process      ETC1_TransmissionShiftInProcess        離散  トランスシフトインプロセス
+   84  speed_kmh             CCVS1::WheelBasedVehicleSpeed        10.0  ホイールベース車速
+  190  engine_speed_rpm      EEC1::EngineSpeed                    50.0  エンジン回転数
+  191  output_shaft_rpm      ETC1::TransmissionOutputShaftSpeed   50.0  アウトプットシャフト回転数
+  522  clutch_slip_pct       ETC1::PercentClutchSlip              50.0  クラッチ滑り率
+  523  gear                  ETC2::TransmissionCurrentGear          離散  現在のギア位置
+  574  shift_in_process      ETC1::TransmissionShiftInProcess       離散  トランスシフトインプロセス
+
+マッピングされなかった列 (2):
+  CCVS1::ParkingBrakeSwitch
+  ETC1::TransmissionDrivelineEngaged
 ```
+
+### 列名の突き合わせ方
+
+`EEC1::EngineSpeed` のような **メッセージ名プレフィックス + UpperCamelCase** に
+対応しています。
+
+- **プレフィックスを外して照合**します。区切りは `::` `:` `.` `/` `__`、および
+  `EEC1_` のように「大文字+数字」トークンの後ろの `_`。
+  `engine_speed` を `engine` + `speed` に割ってしまわないよう、小文字のトークンは
+  プレフィックス扱いしません。外した本体と外さない全体の**両方**で照合するので、
+  外して失敗することはありません。
+- **UpperCamelCase を単語に分解**します(`TransmissionCurrentGear` →
+  `transmission_current_gear`)。
+- プレフィックスがその SPN の PGN と一致していれば**加点**します
+  (`ETC1::` + シフトインプロセス など)。
+- 別名は**特異度順**に評価します。たとえば SPN 512 (`DriversDemandEnginePercentTorque`)
+  は SPN 2432 (`EngineDemandPercentTorque`) より優先され、取り違えません。
+- 1 つの列が複数の信号の候補になった場合は、一致度の高い方に割り当て、
+  負けた側は次点に回します(各列は最大 1 信号)。
+- 対応表に無い列は**マッピングされずに一覧表示**されるので、
+  取りこぼしがないか目で確認できます。
 
 ### この信号セットで何が測れるか
 
@@ -181,9 +206,22 @@ amtlab ingest  --log mylog.csv    # 変速イベントを切り出して KPI 化
 に分解され、遅れがどちらの相にあるか切り分けられます。
 SPN 574 が無い場合はギヤ信号(523)の遷移から推定します(ニュートラル経由に対応)。
 
-### 列名を明示する / 手を入れる
+### 自動検出が外れたとき
 
-自動検出が外れる場合は明示できます(明示 > 自動検出)。
+外れた信号だけを YAML に書けば上書きできます(明示 > 自動検出、残りは自動)。
+
+```yaml
+# signals.yaml
+speed_kmh: "EBC2::FrontAxleSpeed"
+gear: "MyLogger::GearPosition"
+```
+
+```bash
+amtlab inspect --log mylog.csv --map signals.yaml
+amtlab ingest  --log mylog.csv --map signals.yaml
+```
+
+単発なら CLI 引数でも指定できます。
 
 ```bash
 amtlab ingest --log mylog.csv --col-gear GearPos --col-speed Vsp
